@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  # API service
+  api:
+    build:
+      context: .
+      target: api
+    ports:
+      - "8000:8000"
+    volumes:
+      - "./best_segmentation.pth:/app/best_segmentation.pth"  # Mount segmentation model
+      - "./data:/app/data"  # Mount data directory
+    environment:
+      - MODEL_PATH=best_segmentation.pth
+      - THRESHOLD=0.5
+    restart: unless-stopped
+
+  # Demo UI service
+  demo:
+    build:
+      context: .
+      target: demo
+    ports:
+      - "8501:8501"
+    volumes:
+      - "./best_segmentation.pth:/app/best_segmentation.pth"  # Mount segmentation model
+    restart: unless-stopped
+
+  # Training service (run once)
+  train:
+    build:
+      context: .
+      target: train
+    volumes:
+      - "./data:/app/data"  # Mount training data
+      - ".:/app/outputs"    # Mount current directory for output
+    working_dir: /app
+    command: ["python", "src/train.py"]
+    profiles: ["training"]  # Only run when explicitly requested

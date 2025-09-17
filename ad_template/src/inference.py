@@ -1,0 +1,310 @@
+import matplotlib.pyplot as plt
+import torch
+from skimage.metrics import structural_similarity as ssim
+from sklearn.metrics import auc, roc_curve,average_precision_score
+from sklearn.metrics import roc_auc_score
+import time
+import numpy as np
+from scipy.ndimage import gaussian_filter
+import cv2
+import torch.nn as nn
+from models import UNetModel, update_ema_params
+from models import SegmentationSubNetwork
+import torch.nn as nn
+from torch.amp import autocast
+from utils import RealIADTestDataset
+from models import GaussianDiffusionModel, get_beta_schedule
+from math import exp
+import torch.nn.functional as F
+torch.cuda.empty_cache()
+from tqdm import tqdm
+import json
+import os
+from collections import defaultdict
+import pandas as pd
+import torchvision.utils
+import os
+from torch.utils.data import DataLoader
+from skimage.measure import label, regionprops
+import sys
+from utils import BinaryFocalLoss
+
+def preprocess_image(image_path, img_size=(256, 256)):
+    image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, (img_size[1], img_size[0]))
+    image = (image / 255.0)
+    image = np.transpose(image.astype(np.float32), (2, 0, 1))
+    image = torch.from_numpy(image).unsqueeze(0)
+    return image
+
+def denormalize_image(tensor_image):
+    img_np = tensor_image.cpu().squeeze(0).permute(1, 2, 0).numpy()
+    img_np = (img_np + 1) / 2.0
+    img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+    return img_np
+
+def gridify_output(img, row_size=-1):
+    scale_img = lambda img: ((img + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+    return torchvision.utils.make_grid(scale_img(img), nrow=row_size, pad_value=-1).cpu().data.permute(
+            0, 2,
+            1
+            ).contiguous().permute(
+            2, 1, 0
+            )
+
+def defaultdict_from_json(jsonDict):
+    func = lambda: defaultdict(str)
+    dd = func()
+    dd.update(jsonDict)
+    return dd
+
+def load_checkpoint(ckpt_path, device):
+
+    print("checkpoint",ckpt_path)
+
+    from collections import defaultdict
+    try:
+        torch.serialization.add_safe_globals([defaultdict])
+    except Exception:
+        pass
+
+    loaded_model = torch.load(ckpt_path, map_location=device, weights_only=False)
+    return loaded_model
+
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+    return gauss/gauss.sum()
+
+def image_transform(image):
+     return np.clip(image* 255, 0, 255).astype(np.uint8)
+ 
+def cvt2heatmap(gray):
+    heatmap = cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
+    return heatmap
+def show_cam_on_image(img, anomaly_map):
+    cam = np.float32(anomaly_map)/255 + np.float32(img)/255
+    cam = cam / np.max(cam)
+    return np.uint8(255 * cam) 
+
+
+def min_max_norm(image):
+    a_min, a_max = image.min(), image.max()
+    return (image-a_min)/(a_max - a_min)
+
+        
+def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatmap_threshold=0.6):
+    """
+    Hàm predict giờ nhận vào image_tensor đã được xử lý và args từ model.
+    """
+    normal_t = args["eval_normal_t"]
+    noiser_t = args["eval_noisier_t"]
+    
+    image_tensor = image_tensor.to(device)
+
+    normal_t_tensor = torch.tensor([normal_t], device=device).repeat(image_tensor.shape[0])
+    noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(image_tensor.shape[0])
+
+    with torch.no_grad():
+        use_mixed_precision = torch.cuda.is_available() and device.type == 'cuda'
+        if use_mixed_precision:
+            with autocast('cuda'):
+                _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
+                pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+        else:
+            _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
+            pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+            
+    pred_mask = torch.sigmoid(pred_mask_logits)
+    out_mask = pred_mask
+
+    # Tính điểm anomaly
+    topk_out_mask = torch.flatten(out_mask[0], start_dim=1)
+    topk_out_mask = torch.topk(topk_out_mask, 50, dim=1, largest=True)[0]
+    image_score = torch.mean(topk_out_mask)
+
+    # --- Visualisation ---
+    raw_image = denormalize_image(image_tensor)
+    recon_condition = denormalize_image(pred_x_0_condition)
+    recon_normal_t = denormalize_image(pred_x_0_normal)
+    recon_noisier_t = denormalize_image(pred_x_0_noisier)
+    
+    # Tạo heatmap
+    mask_data = out_mask[0, 0].cpu().numpy().astype(np.float32)
+    mask_data[mask_data < heatmap_threshold] = 0
+    ano_map = cv2.GaussianBlur(mask_data, (15, 15), 4)
+    ano_map = min_max_norm(ano_map)
+    ano_map_heatmap = cvt2heatmap(ano_map * 255.0)
+    
+    # Chuyển raw_image sang BGR để overlay
+    raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
+    ano_map_overlay = show_cam_on_image(raw_image_bgr, ano_map_heatmap)
+    # Chuyển lại RGB để matplotlib hiển thị đúng
+    ano_map_overlay = cv2.cvtColor(ano_map_overlay, cv2.COLOR_BGR2RGB)
+    
+    # Hiển thị
+    f, axes = plt.subplots(1, 5, figsize=(20, 4))
+    f.suptitle(f'Anomaly Score: {image_score:.4f}')
+
+    axes[0].imshow(raw_image)
+    axes[0].set_title('Input')
+    axes[0].axis('off')
+
+    axes[1].imshow(recon_condition)
+    axes[1].set_title('Reconstruction')
+    axes[1].axis('off')
+    
+    axes[2].imshow(recon_noisier_t)
+    axes[2].set_title('Recon (Noisier)')
+    axes[2].axis('off')
+    
+    axes[3].imshow((out_mask[0][0].cpu().numpy() * 255.0).astype(np.uint8), cmap='gray')
+    axes[3].set_title('Anomaly Mask')
+    axes[3].axis('off')
+
+    axes[4].imshow(ano_map_overlay)
+    axes[4].set_title('Heatmap Overlay')
+    axes[4].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+def predict_image(unet_model, seg_model, ddpm, image_path, args, device='cpu', heatmap_threshold=0.6):
+    image_tensor = preprocess_image(image_path, img_size=args['img_size'])
+    image_tensor = image_tensor.to(device)
+    return predict(unet_model, seg_model, ddpm, image_tensor, args, device, heatmap_threshold)
+
+def predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device='cpu', heatmap_threshold=0.6):
+    """
+    Predict anomalies for a batch of images
+    Args:
+        unet_model: UNet model
+        seg_model: Segmentation model
+        ddpm: DDPM model
+        image_arrays: List of numpy image arrays
+        args: Model arguments
+        device: Device to run on
+        heatmap_threshold: Threshold for anomaly detection
+    Returns:
+        List of prediction results
+    """
+    results = []
+    for image_array in image_arrays:
+        # Preprocess image
+        if len(image_array.shape) == 3:
+            image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+        else:
+            raise ValueError("Image must be 3D array (H, W, C)")
+        
+        # Resize to model input size
+        image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
+        
+        # Predict for single image
+        result = predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, device, heatmap_threshold, return_visualizations=False)
+        results.append(result)
+    
+    return results
+
+def predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatmap_threshold=0.6, return_visualizations=True):
+    """
+    Predict anomaly for a single image tensor
+    """
+    normal_t = args["eval_normal_t"]
+    noiser_t = args["eval_noisier_t"]
+    
+    image_tensor = image_tensor.to(device)
+    normal_t_tensor = torch.tensor([normal_t], device=device).repeat(image_tensor.shape[0])
+    noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(image_tensor.shape[0])
+
+    with torch.no_grad():
+        use_mixed_precision = torch.cuda.is_available() and device.type == 'cuda'
+        if use_mixed_precision:
+            with autocast('cuda'):
+                _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
+                pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+        else:
+            _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
+            pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+            
+    pred_mask = torch.sigmoid(pred_mask_logits)
+    out_mask = pred_mask
+
+    # Calculate anomaly score
+    topk_out_mask = torch.flatten(out_mask[0], start_dim=1)
+    topk_out_mask = torch.topk(topk_out_mask, 50, dim=1, largest=True)[0]
+    image_score = torch.mean(topk_out_mask).cpu().item()
+
+    result = {
+        "anomaly_score": float(image_score),
+        "is_anomaly": image_score > heatmap_threshold
+    }
+    
+    if return_visualizations:
+        # Create visualizations
+        raw_image = denormalize_image(image_tensor)
+        recon_condition = denormalize_image(pred_x_0_condition)
+        recon_noisier_t = denormalize_image(pred_x_0_noisier)
+        
+        # Create heatmap
+        mask_data = out_mask[0, 0].cpu().numpy().astype(np.float32)
+        mask_data[mask_data < heatmap_threshold] = 0
+        ano_map = cv2.GaussianBlur(mask_data, (15, 15), 4)
+        ano_map = min_max_norm(ano_map)
+        ano_map_heatmap = cvt2heatmap(ano_map * 255.0)
+        
+        # Create overlay
+        raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
+        ano_map_overlay = show_cam_on_image(raw_image_bgr, ano_map_heatmap)
+        ano_map_overlay = cv2.cvtColor(ano_map_overlay, cv2.COLOR_BGR2RGB)
+        
+        result.update({
+            "original_image": raw_image,
+            "reconstructed_image": recon_condition,
+            "recon_noisier": recon_noisier_t,
+            "anomaly_mask": (out_mask[0][0].cpu().numpy() * 255.0).astype(np.uint8),
+            "heatmap_overlay": ano_map_overlay,
+            "heatmap": ano_map
+        })
+    
+    return result
+
+if __name__ == "__main__":
+    
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
+    print(f"Using device: {device}")
+    
+    ckpt_path = "outputs/model/params-last.pt"
+    image_path = "datasets/RealIAD/PCB5/test/bad/pcb_0001_NG_HS_C1_20231028093757.jpg"
+    heatmap_threshold = 0.5
+    # 1. Load checkpoint và lấy args từ đó
+    ckpt_state = load_checkpoint(ckpt_path, device)
+    # args = defaultdict_from_json(ckpt_state['args'])
+    args = json.load(open("args/args1.json"))
+    args = defaultdict_from_json(args)
+    # print(args)
+    
+    # 2. Khởi tạo model với args đã load
+    unet_model = UNetModel(args['img_size'][0], args['base_channels'], channel_mults=args['channel_mults'], dropout=args[
+                "dropout"], n_heads=args["num_heads"], n_head_channels=args["num_head_channels"],
+            in_channels=args["channels"]
+            ).to(device)
+
+    seg_model = SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
+
+    # 3. Khởi tạo DDPM
+    betas = get_beta_schedule(args['T'], args['beta_schedule'])
+    
+    ddpm =  GaussianDiffusionModel(
+            args['img_size'], betas, loss_weight=args['loss_weight'],
+            loss_type=args['loss-type'], noise=args["noise_fn"], img_channels=args["channels"]
+            )
+    
+    # 4. Load state dicts vào model
+    unet_model.load_state_dict(ckpt_state['unet_model_state_dict'])
+    seg_model.load_state_dict(ckpt_state['seg_model_state_dict'])
+    unet_model.eval()
+    seg_model.eval()
+
+
+    # 5. Chạy predict
+    predict_image(unet_model, seg_model, ddpm, image_path, args, device, heatmap_threshold)

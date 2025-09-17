@@ -1,0 +1,7 @@
+data_dir: 'data'
+model: 'resnet18'
+epochs: 2
+batch_size: 128
+lr: 0.001
+input_size: 224
+save_path: 'best_model.pth'
