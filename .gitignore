@@ -1,10 +1,9 @@
-*/data
-*/datasets
-*/outputs
-*/runs
-*/logs
-
-*/results
+data/
+datasets/
+outputs/
+runs/
+logs/
+results/
 *.pt    
 *.pth
 *.pkl
