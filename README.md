@@ -1,268 +1,167 @@
-# Anomaly Detection Template
+# DiffusionAD – Real-Time Industrial QC
 
-A comprehensive template for anomaly detection using Autoencoder and Isolation Forest approaches.
+DiffusionAD is a high-speed, high-accuracy anomaly detection system for industrial quality control using diffusion models. It detects defects without needing labeled defect images.
+
+---
 
 ## Features
 
-- **Autoencoder**: Reconstruction-based anomaly detection with difference heatmaps
-- **Isolation Forest**: Feature-based anomaly detection using pretrained models (ResNet/CLIP)
-- **AUROC Evaluation**: Comprehensive evaluation metrics
-- **Heatmap Visualization**: Visual explanation of anomalies
-- **FastAPI**: Production-ready API endpoints
-- **Streamlit Demo**: Interactive web interface
-- **Docker Support**: Easy deployment and reproducibility
+- **Batch Processing**: Process multiple images in parallel with configurable batch size
+- **Latency Measurement**: Real-time inference latency tracking per image
+- **Interactive Web Interface**: Streamlit-based demo with visualization
+- **REST API**: FastAPI-based API for integration
+- **High Contrast Visualization**: Enhanced anomaly masks and heatmaps for better visibility
+
+---
 
 ## Quick Start
 
-### 1. Setup Environment
+### 1. Setup
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Or use conda
-conda env create -f environment.yml
-conda activate anomaly-detection
 ```
 
 ### 2. Prepare Data
 
-Organize your data in the following structure:
+Organize images like this:
 
 ```
 datasets/
-└── RealIAD
-    └── PCB5
-        ├── DISthresh
-        │   └── good
-        ├── ground_truth
-        │   └── bad_mask
-        ├── test
-        │   ├── bad
-        │   └── good
-        └── train
-            └── good
+├── dtd/
+│   └── images/
+│       ├── banded/
+│       ├── blotchy/
+│       └── ...
+└── RealIAD/
+    └── PCB5/
+        ├── DISthresh/
+        │   └── good/
+        ├── ground_truth/
+        │   └── bad_mask/
+        ├── test/
+        │   ├── bad/
+        │   └── good/
+        └── train/
+            └── good/
 ```
 
-### 3. Train Models
+### 3. Train Model
 
 ```bash
-# Train both models
 python src/train.py
-
-# Train specific model
-# Edit config.yaml to set method: 'autoencoder' or 'isolation_forest'
 ```
 
-### 4. Run Applications
+Training configuration is in `args/args1.json`. Only **good images** are needed for training. The model will be saved to `outputs/model/diff-params-ARGS=1/PCB5/`.
 
-#### Option A: Using Docker (Recommended)
+### 4. Run Inference
+
+#### Web Interface (Streamlit)
 
 ```bash
-# Build and run all services
-docker-compose up --build
-
-# Run specific services
-docker-compose --profile api up      # API only
-docker-compose --profile demo up     # Demo only
-docker-compose --profile training up # Training only
+streamlit run demo/app.py --server.port 8501
 ```
 
-#### Option B: Manual Setup
-
-```bash
-# Start both API and demo
-./run.sh
-
-# Or start individually
-uvicorn api.app:app --host 0.0.0.0 --port 8000  # API
-streamlit run demo/app.py --server.port 8501    # Demo
-```
-
-## Usage
-
-### Training
-
-Configure training parameters in `config.yaml`:
-
-```yaml
-method: 'both'           # 'autoencoder', 'isolation_forest', or 'both'
-epochs: 50
-batch_size: 32
-lr: 0.001
-latent_dim: 128
-contamination: 0.1       # Expected anomaly proportion
-```
-
-### Inference
+Features:
+- **Single Image Analysis**: Upload and analyze individual images with detailed visualizations
+- **Batch Analysis**: Process multiple images with configurable batch size (default: 8)
+- **Real-time Latency**: View inference latency for each image
+- **Visualizations**: 
+  - Original Image
+  - Reconstruction
+  - Recon (Noisier)
+  - Anomaly Mask (high contrast, colored)
+  - Heatmap Overlay
 
 #### Python API
 
 ```python
-from src.inference import AutoencoderInference, IsolationForestInference
+import sys
+sys.path.append('src')
+from inference import load_checkpoint, predict_image, defaultdict_from_json
+import json
+import torch
 
-# Autoencoder
-detector = AutoencoderInference('best_autoencoder.pth')
-result = detector.predict('path/to/image.jpg', return_heatmap=True)
+# Load model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ckpt_state = load_checkpoint('outputs/model/diff-params-ARGS=1/PCB5/params-last.pt', device)
+args = defaultdict_from_json(json.load(open('args/args1.json')))
 
-# Isolation Forest
-detector = IsolationForestInference('best_isolation_forest.pkl')
-result = detector.predict('path/to/image.jpg')
+# Initialize models (see src/inference.py for full example)
+# ...
 
-print(f"Anomaly Score: {result['anomaly_score']}")
-print(f"Is Anomaly: {result['is_anomaly']}")
-```
-
-#### REST API
-
-```bash
-# Single image prediction
-curl -X POST "http://localhost:8000/predict" \
-  -F "file=@image.jpg" \
-  -F "method=autoencoder" \
-  -F "return_heatmap=true"
+# Predict single image
+result = predict_image(unet_model, seg_model, ddpm, 'test_image.jpg', args, device)
 
 # Batch prediction
-curl -X POST "http://localhost:8000/predict_batch" \
-  -F "files=@image1.jpg" \
-  -F "files=@image2.jpg" \
-  -F "method=isolation_forest"
+from inference import predict_batch
+results = predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device, 
+                       batch_size=8)
 ```
 
-#### Web Interface
+#### REST API (FastAPI)
 
-Access the Streamlit demo at `http://localhost:8501` for:
-- Single image analysis with visual results
-- Batch processing
-- Interactive model comparison
+```bash
+# Start API server
+cd api
+uvicorn app:app --host 0.0.0.0 --port 8000
 
-## Model Details
+# Make prediction
+curl -X POST "http://localhost:8000/predict" -F "file=@test_image.jpg"
+```
 
-### Autoencoder
+---
 
-- **Architecture**: Convolutional autoencoder with encoder-decoder structure
-- **Loss**: MSE reconstruction loss
-- **Anomaly Score**: Reconstruction error (MSE between input and output)
-- **Visualization**: Difference heatmaps showing reconstruction errors
+## Output
 
-### Isolation Forest
+* **Anomaly Score**: Numerical value (0-1) indicating anomaly probability
+* **Anomaly Mask**: High contrast colored mask showing defect locations (HOT colormap)
+* **Heatmap Overlay**: Overlay of anomaly heatmap on original image
+* **Reconstruction**: Model's reconstruction of the input image
+* **Inference Latency**: Time taken for inference (in milliseconds)
 
-- **Features**: Extracted from pretrained ResNet models
-- **Algorithm**: Unsupervised outlier detection
-- **Anomaly Score**: Isolation score (lower = more anomalous)
-- **Scalability**: Efficient for large datasets
+---
+
+## Project Structure
+
+```
+diffuisionAD/
+├── src/
+│   ├── train.py          # Training script
+│   ├── inference.py      # Inference functions (single & batch)
+│   ├── eval.py           # Evaluation script
+│   ├── models.py         # Model definitions
+│   └── utils.py          # Utility functions
+├── demo/
+│   └── app.py            # Streamlit web interface
+├── api/
+│   └── app.py            # FastAPI REST API
+├── args/
+│   └── args1.json        # Training arguments
+├── datasets/             # Dataset directory
+└── outputs/              # Model outputs and checkpoints
+    └── model/
+        └── diff-params-ARGS=1/
+            └── PCB5/
+                └── params-last.pt
+```
+
+---
 
 ## Configuration
 
-### Data Configuration
-```yaml
-data_dir: 'data'
-input_size: 224
-input_channels: 3
-```
+Training parameters are configured in `args/args1.json`. Key parameters:
+- `img_size`: Input image size
+- `batch_size`: Training batch size
+- `T`: Diffusion timesteps
+- `eval_normal_t`, `eval_noisier_t`: Evaluation timesteps
+- `base_channels`: Base channels for UNet
+- `channel_mults`: Channel multipliers for UNet
 
-### Training Configuration
-```yaml
-method: 'both'
-epochs: 50
-batch_size: 32
-lr: 0.001
-```
+---
 
-### Model-Specific Settings
-```yaml
-# Autoencoder
-latent_dim: 128
+## Performance
 
-# Isolation Forest
-feature_extractor: 'resnet18'
-contamination: 0.1
-```
-
-## API Endpoints
-
-### Main Endpoints
-
-- `GET /` - API information
-- `GET /health` - Health check
-- `POST /predict` - Single image prediction
-- `POST /predict_batch` - Batch prediction
-- `GET /models/info` - Model information
-
-### Request/Response Format
-
-```json
-{
-  "method": "autoencoder",
-  "anomaly_score": 0.0234,
-  "is_anomaly": false,
-  "confidence": 0.0234,
-  "original_image": "data:image/png;base64,...",
-  "reconstructed_image": "data:image/png;base64,...",
-  "heatmap": "data:image/png;base64,..."
-}
-```
-
-## Evaluation Metrics
-
-- **AUROC**: Area Under ROC Curve
-- **Precision-Recall Curve**: For imbalanced datasets
-- **Confusion Matrix**: Classification performance
-- **Score Distribution**: Visual analysis of anomaly scores
-
-## File Structure
-
-```
-ad_template/
-├── src/
-│   ├── models.py          # Model definitions
-│   ├── train.py           # Training script
-│   ├── inference.py       # Inference utilities
-│   └── utils.py           # Helper functions
-├── api/
-│   └── app.py             # FastAPI application
-├── demo/
-│   └── app.py             # Streamlit demo
-├── data/                  # Data directory
-├── runs/                  # Training outputs
-├── config.yaml            # Configuration
-├── requirements.txt       # Dependencies
-├── Dockerfile            # Docker configuration
-├── docker-compose.yml    # Docker Compose
-└── run.sh                # Startup script
-```
-
-## Tips for Best Results
-
-### Data Preparation
-1. Ensure training data contains only normal samples
-2. Use sufficient validation data with both normal and anomaly samples
-3. Balance the validation set if possible
-
-### Hyperparameter Tuning
-1. Adjust `contamination` based on expected anomaly rate
-2. Tune `latent_dim` for autoencoder complexity
-3. Experiment with different feature extractors
-
-### Threshold Calibration
-1. Use validation data to find optimal thresholds
-2. Consider precision-recall trade-offs
-3. Adjust based on business requirements
-
-## Troubleshooting
-
-### Common Issues
-
-1. **CUDA out of memory**: Reduce batch_size
-2. **Poor performance**: Check data quality and balance
-3. **Model not loading**: Verify file paths and model compatibility
-
-### Performance Optimization
-
-1. Use GPU for training: Set device in config
-2. Optimize batch size for your hardware
-3. Use appropriate number of workers for data loading
-
-## License
-
-This template is provided as-is for educational and research purposes.
+- **Batch Processing**: Process multiple images simultaneously on GPU
+- **Latency Tracking**: Real-time inference time measurement
+- **GPU Acceleration**: Automatic CUDA support with mixed precision
