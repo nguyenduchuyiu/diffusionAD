@@ -1,9 +1,0 @@
-data_dir: 'data/Fruits-detection'
-model: 'yolov8n.pt'  # yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
-epochs: 2
-batch_size: 16
-lr: 0.01
-input_size: 640
-save_path: 'best_yolo.pt'
-confidence: 0.25
-iou: 0.45

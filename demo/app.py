@@ -17,12 +17,13 @@ import pandas as pd
 import torch
 import json
 from collections import defaultdict
+import time
 
 # Add src directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 try:
-    from inference import preprocess_image, predict, load_checkpoint, defaultdict_from_json, denormalize_image, min_max_norm, cvt2heatmap, show_cam_on_image
+    from inference import preprocess_image, predict, load_checkpoint, defaultdict_from_json, denormalize_image, min_max_norm, cvt2heatmap, show_cam_on_image, predict_batch
     from models import UNetModel, SegmentationSubNetwork, GaussianDiffusionModel, get_beta_schedule
 except ImportError as e:
     st.error(f"Failed to import modules: {e}")
@@ -60,6 +61,12 @@ st.markdown("""
     }
     .anomaly-score-high {
         color: #dc3545;
+    }
+    /* Ensure all images in visualization columns have same height */
+    div[data-testid="column"] div[data-testid="stImage"] img {
+        max-height: 300px;
+        width: 100%;
+        object-fit: contain;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -174,9 +181,12 @@ def predict_single_image(models, image_array, heatmap_threshold=0.6):
     normal_t_tensor = torch.tensor([normal_t], device=device).repeat(image_tensor.shape[0])
     noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(image_tensor.shape[0])
 
+    # Measure inference time
+    inference_start = time.time()
     with torch.no_grad():
         _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
         pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+    inference_time = time.time() - inference_start
             
     pred_mask = torch.sigmoid(pred_mask_logits)
     out_mask = pred_mask
@@ -187,21 +197,47 @@ def predict_single_image(models, image_array, heatmap_threshold=0.6):
     image_score = torch.mean(topk_out_mask).cpu().item()
 
     # Create visualizations
-    raw_image = denormalize_image(image_tensor)
+    # Original image: convert from [0, 1] directly to [0, 255] (not [-1, 1])
+    raw_image_np = image_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy()
+    raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+    
+    # Reconstructed images: use denormalize (model outputs are in [-1, 1])
     recon_condition = denormalize_image(pred_x_0_condition)
     recon_noisier_t = denormalize_image(pred_x_0_noisier)
     
-    # Create heatmap
+    # Create heatmap with higher contrast
     mask_data = out_mask[0, 0].cpu().numpy().astype(np.float32)
     mask_data[mask_data < heatmap_threshold] = 0
-    ano_map = cv2.GaussianBlur(mask_data, (15, 15), 4)
+    
+    # Apply contrast enhancement using gamma correction
+    gamma = 0.1  # Lower gamma = higher contrast for bright areas
+    mask_data_enhanced = np.power(mask_data, gamma)
+    
+    ano_map = cv2.GaussianBlur(mask_data_enhanced, (15, 15), 4)
     ano_map = min_max_norm(ano_map)
-    ano_map_heatmap = cvt2heatmap(ano_map * 255.0)
+    
+    # Use HOT colormap for better visibility (red/yellow/white)
+    ano_map_heatmap = cv2.applyColorMap(np.uint8(ano_map * 255.0), cv2.COLORMAP_HOT)
     
     # Create overlay
     raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
     ano_map_overlay = show_cam_on_image(raw_image_bgr, ano_map_heatmap)
     ano_map_overlay = cv2.cvtColor(ano_map_overlay, cv2.COLOR_BGR2RGB)
+    
+    # Create enhanced anomaly mask with high contrast
+    mask_raw = out_mask[0][0].cpu().numpy().astype(np.float32)
+    # Apply threshold to remove low values
+    mask_raw[mask_raw < heatmap_threshold] = 0
+    # Apply gamma correction for contrast enhancement
+    mask_enhanced = np.power(mask_raw, 0.3)
+    # Normalize to full range [0, 1]
+    mask_normalized = min_max_norm(mask_enhanced)
+    # Apply contrast stretching - map to full [0, 255] range
+    mask_stretched = (mask_normalized * 255.0).astype(np.uint8)
+    # Apply colormap for better visibility (HOT: black->red->yellow->white)
+    anomaly_mask_colored = cv2.applyColorMap(mask_stretched, cv2.COLORMAP_HOT)
+    # Convert BGR to RGB for display
+    anomaly_mask_colored = cv2.cvtColor(anomaly_mask_colored, cv2.COLOR_BGR2RGB)
     
     return {
         "anomaly_score": float(image_score),
@@ -209,14 +245,39 @@ def predict_single_image(models, image_array, heatmap_threshold=0.6):
         "original_image": raw_image,
         "reconstructed_image": recon_condition,
         "recon_noisier": recon_noisier_t,
-        "anomaly_mask": (out_mask[0][0].cpu().numpy() * 255.0).astype(np.uint8),
+        "anomaly_mask": anomaly_mask_colored,
         "heatmap_overlay": ano_map_overlay,
-        "heatmap": ano_map
+        "heatmap": ano_map,
+        "inference_time": inference_time
     }
+
+def predict_batch_images(models, image_arrays, batch_size=8, heatmap_threshold=0.6, progress_bar=None, status_text=None):
+    """Predict anomalies for a batch of images with parallel processing"""
+    unet_model = models['unet_model']
+    seg_model = models['seg_model']
+    ddpm = models['ddpm']
+    args = models['args']
+    device = models['device']
+    
+    # Progress callback function
+    def progress_callback(progress, status):
+        if progress_bar is not None and status_text is not None:
+            progress_bar.progress(progress)
+            status_text.text(status)
+    
+    # Use predict_batch from inference.py
+    results = predict_batch(
+        unet_model, seg_model, ddpm, image_arrays, args, device, 
+        heatmap_threshold=heatmap_threshold, 
+        batch_size=batch_size,
+        progress_callback=progress_callback if progress_bar is not None else None
+    )
+    
+    return results
 
 def display_prediction_results(result, method, image):
     """Display prediction results"""
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric(
@@ -240,6 +301,20 @@ def display_prediction_results(result, method, image):
             delta=None
         )
     
+    with col4:
+        if 'inference_time' in result:
+            st.metric(
+                label="Inference Latency",
+                value=f"{result['inference_time']*1000:.2f} ms",
+                delta=None
+            )
+        else:
+            st.metric(
+                label="Inference Latency",
+                value="N/A",
+                delta=None
+            )
+    
     # Display visualizations for diffusion model
     if 'heatmap' in result:
         st.subheader("Visual Analysis")
@@ -247,7 +322,7 @@ def display_prediction_results(result, method, image):
         col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            st.subheader("Original")
+            st.subheader("Original Image")
             st.image(result['original_image'], use_container_width=True)
         
         with col2:
@@ -277,44 +352,48 @@ def batch_analysis_page(models):
     )
     
     if uploaded_files:
-        threshold = st.slider("Anomaly Threshold", min_value=0.0, max_value=1.0, value=0.6, step=0.1)
+        col1, col2 = st.columns(2)
+        with col1:
+            threshold = st.slider("Anomaly Threshold", min_value=0.0, max_value=1.0, value=0.6, step=0.1)
+        with col2:
+            batch_size = st.slider("Batch Size", min_value=1, max_value=32, value=8, step=1)
         
         if st.button("Analyze Batch"):
             if models is None:
                 st.error("Diffusion models not available!")
                 return
             
-            results = []
+            # Convert uploaded files to image arrays
+            image_arrays = []
+            filenames = []
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for i, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f'Processing {uploaded_file.name}...')
-                
-                # Convert uploaded file to image
+            for uploaded_file in uploaded_files:
                 image = Image.open(uploaded_file)
                 image_array = np.array(image)
-                
-                # Predict
-                result = predict_single_image(models, image_array, heatmap_threshold=threshold)
-                
-                results.append({
-                    'filename': uploaded_file.name,
-                    'anomaly_score': result['anomaly_score'],
-                    'is_anomaly': result['is_anomaly'],
-                    'confidence': abs(result['anomaly_score'])
-                })
-                
-                progress_bar.progress((i + 1) / len(uploaded_files))
+                image_arrays.append(image_array)
+                filenames.append(uploaded_file.name)
             
-            status_text.text('Analysis complete!')
+            # Process in batches
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            status_text.text(f'Initializing... Processing {len(uploaded_files)} images in batches of {batch_size}...')
+            
+            results = predict_batch_images(models, image_arrays, batch_size=batch_size, heatmap_threshold=threshold, 
+                                         progress_bar=progress_bar, status_text=status_text)
+            
+            # Add filenames to results
+            for i, result in enumerate(results):
+                result['filename'] = filenames[i]
+                result['confidence'] = abs(result['anomaly_score'])
+            
+            progress_bar.progress(1.0)
+            status_text.text(f'Analysis complete! Processed {len(results)} images.')
             
             # Display results
             df = pd.DataFrame(results)
             
             # Summary statistics
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
                 st.metric("Total Images", len(results))
@@ -327,17 +406,34 @@ def batch_analysis_page(models):
             with col4:
                 anomaly_rate = anomaly_count / len(results) * 100 if results else 0
                 st.metric("Anomaly Rate", f"{anomaly_rate:.1f}%")
+            with col5:
+                avg_latency = df['inference_time'].mean() * 1000  # Convert to ms
+                st.metric("Avg Latency", f"{avg_latency:.2f} ms")
             
             # Results table
             st.subheader("Detailed Results")
-            st.dataframe(df)
+            # Format latency column for display
+            df_display = df.copy()
+            df_display['inference_time_ms'] = df_display['inference_time'].apply(lambda x: f"{x*1000:.2f} ms")
+            df_display = df_display[['filename', 'anomaly_score', 'is_anomaly', 'confidence', 'inference_time_ms']]
+            st.dataframe(df_display)
             
             # Visualizations
-            st.subheader("Score Distribution")
-            fig = px.histogram(df, x='anomaly_score', color='is_anomaly',
-                             title='Anomaly Score Distribution',
-                             labels={'anomaly_score': 'Anomaly Score', 'count': 'Count'})
-            st.plotly_chart(fig)
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Score Distribution")
+                fig = px.histogram(df, x='anomaly_score', color='is_anomaly',
+                                 title='Anomaly Score Distribution',
+                                 labels={'anomaly_score': 'Anomaly Score', 'count': 'Count'})
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                st.subheader("Latency Distribution")
+                fig = px.histogram(df, x='inference_time', 
+                                 title='Inference Time Distribution',
+                                 labels={'inference_time': 'Inference Time (seconds)', 'count': 'Count'})
+                st.plotly_chart(fig, use_container_width=True)
             
             # Download results
             csv = df.to_csv(index=False)

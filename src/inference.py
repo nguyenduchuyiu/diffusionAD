@@ -173,9 +173,9 @@ def predict_image(unet_model, seg_model, ddpm, image_path, args, device='cpu', h
     image_tensor = image_tensor.to(device)
     return predict(unet_model, seg_model, ddpm, image_tensor, args, device, heatmap_threshold)
 
-def predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device='cpu', heatmap_threshold=0.6):
+def predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device='cpu', heatmap_threshold=0.6, batch_size=8, progress_callback=None):
     """
-    Predict anomalies for a batch of images
+    Predict anomalies for a batch of images with parallel processing
     Args:
         unet_model: UNet model
         seg_model: Segmentation model
@@ -184,23 +184,95 @@ def predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device='cpu',
         args: Model arguments
         device: Device to run on
         heatmap_threshold: Threshold for anomaly detection
+        batch_size: Batch size for parallel processing
+        progress_callback: Optional callback function(progress, status_text) for progress updates
     Returns:
-        List of prediction results
+        List of prediction results with inference_time
     """
     results = []
-    for image_array in image_arrays:
-        # Preprocess image
-        if len(image_array.shape) == 3:
-            image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
-        else:
-            raise ValueError("Image must be 3D array (H, W, C)")
+    total_images = len(image_arrays)
+    num_batches = (total_images + batch_size - 1) // batch_size
+    
+    # Process images in batches
+    for batch_idx in range(0, len(image_arrays), batch_size):
+        batch_images = image_arrays[batch_idx:batch_idx + batch_size]
+        current_batch = batch_idx // batch_size + 1
         
-        # Resize to model input size
-        image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
+        # Update progress
+        if progress_callback is not None:
+            progress = batch_idx / total_images
+            status_text = f'Processing batch {current_batch}/{num_batches} ({len(batch_images)} images)...'
+            progress_callback(progress, status_text)
         
-        # Predict for single image
-        result = predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, device, heatmap_threshold, return_visualizations=False)
-        results.append(result)
+        # Preprocess batch - process all images in parallel
+        batch_tensors = []
+        for image_array in batch_images:
+            if len(image_array.shape) == 3:
+                image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+            else:
+                raise ValueError("Image must be 3D array (H, W, C)")
+            
+            # Resize to model input size
+            image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
+            batch_tensors.append(image_tensor)
+        
+        # Stack into batch tensor - this enables parallel processing on GPU
+        batch_tensor = torch.cat(batch_tensors, dim=0).to(device)
+        
+        normal_t = args["eval_normal_t"]
+        noiser_t = args["eval_noisier_t"]
+        
+        normal_t_tensor = torch.tensor([normal_t], device=device).repeat(batch_tensor.shape[0])
+        noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(batch_tensor.shape[0])
+        
+        # Synchronize GPU before timing (for accurate measurement)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        # Measure inference time for batch - all images processed in parallel
+        inference_start = time.time()
+        with torch.no_grad():
+            use_mixed_precision = torch.cuda.is_available() and device.type == 'cuda'
+            if use_mixed_precision:
+                with autocast('cuda'):
+                    _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, batch_tensor, normal_t_tensor, noiser_t_tensor, args)
+                    pred_mask_logits = seg_model(torch.cat((batch_tensor, pred_x_0_condition), dim=1))
+            else:
+                _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, batch_tensor, normal_t_tensor, noiser_t_tensor, args)
+                pred_mask_logits = seg_model(torch.cat((batch_tensor, pred_x_0_condition), dim=1))
+        
+        # Synchronize GPU after inference (for accurate timing)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        batch_inference_time = time.time() - inference_start
+        
+        pred_mask = torch.sigmoid(pred_mask_logits)
+        out_mask = pred_mask
+        
+        # Process each image in batch (post-processing)
+        for i in range(batch_tensor.shape[0]):
+            # Calculate anomaly score
+            topk_out_mask = torch.flatten(out_mask[i], start_dim=1)
+            topk_out_mask = torch.topk(topk_out_mask, 50, dim=1, largest=True)[0]
+            image_score = torch.mean(topk_out_mask).cpu().item()
+            
+            # Each image in batch is processed in parallel, so effective latency per image
+            # is approximately the batch time (since they run simultaneously on GPU)
+            # We record the batch time as the inference time for each image
+            per_image_time = batch_inference_time
+            
+            results.append({
+                "anomaly_score": float(image_score),
+                "is_anomaly": image_score > heatmap_threshold,
+                "inference_time": per_image_time
+            })
+        
+        # Update progress after processing batch
+        if progress_callback is not None:
+            progress = min((batch_idx + len(batch_images)) / total_images, 1.0)
+            status_text = f'Completed batch {current_batch}/{num_batches} ({len(results)}/{total_images} images processed)...'
+            progress_callback(progress, status_text)
     
     return results
 
