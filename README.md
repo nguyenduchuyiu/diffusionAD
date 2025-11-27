@@ -12,7 +12,14 @@ DiffusionAD is a high-speed, high-accuracy anomaly detection system for industri
 - **REST API**: FastAPI-based API for integration
 - **High Contrast Visualization**: Enhanced anomaly masks and heatmaps for better visibility
 
+## Demo
+
+<p align="center">
+  <img src="demo.png" alt="Demo Example" width="700">
+</p>
+
 ---
+
 
 ## Quick Start
 
@@ -160,8 +167,6 @@ Training parameters are configured in `args/args1.json`. Key parameters:
 
 ---
 
-## Performance
 
-- **Batch Processing**: Process multiple images simultaneously on GPU
-- **Latency Tracking**: Real-time inference time measurement
-- **GPU Acceleration**: Automatic CUDA support with mixed precision
+
+

@@ -26,6 +26,3 @@ plotly>=5.15.0
 tqdm>=4.65.0
 pathlib2>=2.3.7
 
-# Optional: GPU support (uncomment if using CUDA)
-# torch-audio>=2.0.0
-# torchaudio>=2.0.0
