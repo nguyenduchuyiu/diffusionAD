@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision.transforms as T
+import torch.utils.checkpoint as checkpoint
 
 def get_beta_schedule(num_diffusion_steps, name="cosine"):
     betas = []
@@ -781,6 +782,13 @@ class UNetModel(nn.Module):
                 nn.SiLU(),
                 zero_module(nn.Conv2d(base_channels * channel_mults[0], self.out_channels, 3, padding=1))
                 )
+        
+        # Gradient checkpointing flag
+        self.use_checkpoint = False
+
+    def enable_gradient_checkpointing(self):
+        self.use_checkpoint = True
+        print("Gradient checkpointing enabled for UNetModel")
 
     def forward(self, x, time):
 
@@ -789,13 +797,26 @@ class UNetModel(nn.Module):
         skips = []
 
         h = x.type(self.dtype)
+        
         for i, module in enumerate(self.down):
-            h = module(h, time_embed)
+            if self.use_checkpoint and self.training:
+                h = checkpoint.checkpoint(module, h, time_embed, use_reentrant=False)
+            else:
+                h = module(h, time_embed)
             skips.append(h)
-        h = self.middle(h, time_embed)
+        
+        if self.use_checkpoint and self.training:
+            h = checkpoint.checkpoint(self.middle, h, time_embed, use_reentrant=False)
+        else:
+            h = self.middle(h, time_embed)
+        
         for i, module in enumerate(self.up):
             h = torch.cat([h, skips.pop()], dim=1)
-            h = module(h, time_embed)
+            if self.use_checkpoint and self.training:
+                h = checkpoint.checkpoint(module, h, time_embed, use_reentrant=False)
+            else:
+                h = module(h, time_embed)
+        
         h = h.type(x.dtype)
         h = self.out(h)
         return h

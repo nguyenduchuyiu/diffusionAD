@@ -113,7 +113,7 @@ def plot_learning_curves(train_loss_list, train_noise_loss_list, train_focal_los
         if len(loss_x_list) > 0:
             current_epoch = loss_x_list[-1] if loss_x_list else 0
             current_loss = train_loss_list[-1] if train_loss_list else 0
-            print(f"📊 Loss tracking: Epoch {current_epoch}, Loss: {current_loss:.4f}")
+            print(f"Loss tracking: Epoch {current_epoch}, Loss: {current_loss:.4f}")
     else:
         # Save the plot to file
         os.makedirs(f'{args["output_path"]}/learning_curves/ARGS={args["arg_num"]}', exist_ok=True)
@@ -125,7 +125,7 @@ def plot_learning_curves(train_loss_list, train_noise_loss_list, train_focal_los
         if len(loss_x_list) > 0:
             current_epoch = loss_x_list[-1] if loss_x_list else 0
             current_loss = train_loss_list[-1] if train_loss_list else 0
-            print(f"📊 Loss tracking: Epoch {current_epoch}, Loss: {current_loss:.4f}")
+            print(f"Loss tracking: Epoch {current_epoch}, Loss: {current_loss:.4f}")
             print(f"   📁 Saved to: outputs/learning_curves/ARGS={args['arg_num']}/{sub_class}_learning_curves.png")
 
 def is_jupyter_environment():
@@ -137,11 +137,9 @@ def is_jupyter_environment():
         return False
 
 def signal_handler(signum, frame):
-    """Handle Ctrl+C interrupt - save checkpoint before exit"""
-    print(f"\n🛑 Training interrupted! Saving checkpoint...")
+    print(f"\nTraining interrupted! Saving checkpoint...")
     
     try:
-        # Save current training state
         if 'current_models' in globals() and 'current_training_data' in globals():
             unet_model, seg_model = current_models
             args = current_args
@@ -160,15 +158,15 @@ def signal_handler(signum, frame):
             save(unet_model, seg_model, args=args, final='last', epoch=current_epoch, 
                  sub_class=sub_class, training_history=interrupt_history)
             
-            print(f"💾 Emergency checkpoint saved at epoch {current_epoch + 1}")
-            print(f"📊 You can resume training by setting 'resume_training': true")
+            print(f"Emergency checkpoint saved at epoch {current_epoch + 1}")
+            print(f"You can resume training by setting 'resume_training': true")
         else:
-            print("⚠️  No training data to save")
+            print("No training data to save")
             
     except Exception as e:
-        print(f"❌ Error saving checkpoint: {e}")
+        print(f"Error saving checkpoint: {e}")
     
-    print("👋 Exiting...")
+    print("Exiting...")
     sys.exit(0)
 
 def monitor_system_resources():
@@ -195,12 +193,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     # Global variables for signal handler
     global current_models, current_args, current_sub_class, current_training_data
     
-    # Check if running in Jupyter environment
     use_inline_plots = is_jupyter_environment()
-    if use_inline_plots:
-        print("📊 Detected Jupyter environment - using inline plots to save memory")
-    else:
-        print("📊 Using file-based plots")
     
     # Check for resume training
     resume_from_checkpoint = args.get('resume_training', False)
@@ -225,6 +218,11 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
 
     seg_model=SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
 
+    use_gradient_checkpointing = args.get('use_gradient_checkpointing', True)
+    if use_gradient_checkpointing:
+        unet_model.enable_gradient_checkpointing()
+        print("Gradient Checkpointing: Enabled")
+
     # Enable multi-GPU training if available
     if num_gpus > 1:
         print(f"Wrapping models with DataParallel for {num_gpus} GPUs")
@@ -246,17 +244,28 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     
     optimizer_seg = optim.Adam(seg_model.parameters(),lr=args['seg_lr'],weight_decay=args['weight_decay'])
     
-    # Initialize mixed precision scaler
     use_mixed_precision = args.get('use_mixed_precision', True) and torch.cuda.is_available()
-    scaler = GradScaler() if use_mixed_precision else None
+    use_bfloat16 = args.get('use_bfloat16', True) and torch.cuda.is_available()
+    if use_mixed_precision:
+        scaler = GradScaler(enabled=(not use_bfloat16))
+    else:
+        scaler = None
     
     # Gradient accumulation settings
     gradient_accumulation_steps = args.get('gradient_accumulation_steps', 1)
     effective_batch_size = args['Batch_Size'] * gradient_accumulation_steps
     
-    print(f"Mixed Precision (FP16): {'Enabled' if use_mixed_precision else 'Disabled'}")
+    precision_str = "BFloat16" if (use_mixed_precision and use_bfloat16) else ("FP16" if use_mixed_precision else "FP32")
+    print(f"Mixed Precision: {precision_str} ({'Enabled' if use_mixed_precision else 'Disabled'})")
     print(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
     print(f"Effective Batch Size: {effective_batch_size}")
+    
+    if torch.cuda.is_available():
+        print("\n" + "="*60)
+        print("INITIAL MEMORY DIAGNOSTICS")
+        print("="*60)
+        print(torch.cuda.memory_summary(device=device, abbreviated=False))
+        print("="*60 + "\n")
 
     loss_focal = BinaryFocalLoss().to(device)
     loss_smL1= nn.SmoothL1Loss().to(device)
@@ -264,26 +273,23 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
 
     scheduler_seg =optim.lr_scheduler.CosineAnnealingLR(optimizer_seg, T_max=10, eta_min=0, last_epoch=- 1)
     
-    # Initialize training variables
     train_loss_list=[]
     train_noise_loss_list=[]
     train_focal_loss_list=[]
     train_smL1_loss_list=[]
     loss_x_list=[]
-    best_loss=float('inf')  # Track best (lowest) loss
+    best_loss=float('inf')
     best_epoch=0
     image_auroc_list=[]
     pixel_auroc_list=[]
     performance_x_list=[]
     
-    # Resume training if checkpoint exists
     if resume_from_checkpoint:
         checkpoint_path = f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/{sub_class}/params-last.pt'
         if os.path.exists(checkpoint_path):
-            print(f"🔄 Resuming training from {checkpoint_path}")
+            print(f"Resuming training from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device)
             
-            # Load model states
             if hasattr(unet_model, 'module'):
                 unet_model.module.load_state_dict(checkpoint['unet_model_state_dict'])
                 seg_model.module.load_state_dict(checkpoint['seg_model_state_dict'])
@@ -292,9 +298,8 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
                 seg_model.load_state_dict(checkpoint['seg_model_state_dict'])
             
             start_epoch = checkpoint['n_epoch']
-            print(f"🎯 Resuming from epoch {start_epoch}")
+            print(f"Resuming from epoch {start_epoch}")
             
-            # Load loss history if available
             if 'train_loss_list' in checkpoint:
                 train_loss_list = checkpoint.get('train_loss_list', [])
                 train_noise_loss_list = checkpoint.get('train_noise_loss_list', [])
@@ -303,16 +308,14 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
                 loss_x_list = checkpoint.get('loss_x_list', [])
                 best_loss = checkpoint.get('best_loss', float('inf'))
                 best_epoch = checkpoint.get('best_epoch', 0)
-                print(f"📊 Loaded loss history: {len(train_loss_list)} epochs")
-                print(f"🏆 Best loss so far: {best_loss:.4f} at epoch {best_epoch + 1}")
+                print(f"Loaded loss history: {len(train_loss_list)} epochs")
+                print(f"Best loss so far: {best_loss:.4f} at epoch {best_epoch + 1}")
         else:
-            print(f"⚠️  No checkpoint found at {checkpoint_path}, starting from scratch")
+            print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
             start_epoch = 0
     
-    # Setup Ctrl+C handler
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Update global variables for signal handler
     current_models = (unet_model, seg_model)
     current_args = args
     current_sub_class = sub_class
@@ -325,10 +328,8 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     }
     
     tqdm_epoch = range(start_epoch, args['EPOCHS'])
-    
-    # Performance monitoring
     epoch_times = []
-    resource_monitor_interval = 100  # Monitor resources every 100 epochs
+    resource_monitor_interval = 100
     
     for epoch in tqdm_epoch:
         epoch_start_time = time.time()
@@ -340,51 +341,50 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
         train_noise_loss = 0.0
         tbar = tqdm(training_dataset_loader)
         
-        # Initialize gradient accumulation
         optimizer_ddpm.zero_grad()
         optimizer_seg.zero_grad()
         
         for i, sample in enumerate(tbar):
             batch_start_time = time.time()
             
-            # Profile data loading
             with profiler.timer('data_loading'):
                 aug_image=sample['augmented_image'].to(device)
                 anomaly_mask = sample["anomaly_mask"].to(device)
                 anomaly_label = sample["has_anomaly"].to(device).squeeze()
 
-            # Profile forward pass
             with profiler.timer('forward_pass'):
-                # Mixed precision forward pass
                 if use_mixed_precision:
-                    with autocast('cuda'):
-                        noise_loss, pred_x0,normal_t,x_normal_t,x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(unet_model, aug_image, anomaly_label,args)
-                        pred_mask = seg_model(torch.cat((aug_image, pred_x0), dim=1)) 
-
-                        #loss
-                        focal_loss = loss_focal(pred_mask,anomaly_mask)
-                        smL1_loss = loss_smL1(pred_mask, anomaly_mask)
-                        loss = (noise_loss + 5*focal_loss + smL1_loss) / gradient_accumulation_steps
+                    if use_bfloat16:
+                        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            noise_loss, pred_x0,normal_t,x_normal_t,x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(unet_model, aug_image, anomaly_label,args)
+                            pred_mask = seg_model(torch.cat((aug_image, pred_x0), dim=1)) 
+                            focal_loss = loss_focal(pred_mask,anomaly_mask)
+                            smL1_loss = loss_smL1(pred_mask, anomaly_mask)
+                            loss = (noise_loss + 5*focal_loss + smL1_loss) / gradient_accumulation_steps
+                    else:
+                        with autocast('cuda'):
+                            noise_loss, pred_x0,normal_t,x_normal_t,x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(unet_model, aug_image, anomaly_label,args)
+                            pred_mask = seg_model(torch.cat((aug_image, pred_x0), dim=1)) 
+                            focal_loss = loss_focal(pred_mask,anomaly_mask)
+                            smL1_loss = loss_smL1(pred_mask, anomaly_mask)
+                            loss = (noise_loss + 5*focal_loss + smL1_loss) / gradient_accumulation_steps
                 else:
                     noise_loss, pred_x0,normal_t,x_normal_t,x_noiser_t = ddpm_sample.norm_guided_one_step_denoising(unet_model, aug_image, anomaly_label,args)
                     pred_mask = seg_model(torch.cat((aug_image, pred_x0), dim=1)) 
-
-                    #loss
                     focal_loss = loss_focal(pred_mask,anomaly_mask)
                     smL1_loss = loss_smL1(pred_mask, anomaly_mask)
                     loss = (noise_loss + 5*focal_loss + smL1_loss) / gradient_accumulation_steps
             
-            # Profile backward pass
             with profiler.timer('backward_pass'):
-                # Mixed precision backward pass
                 if use_mixed_precision:
-                    scaler.scale(loss).backward()
+                    if use_bfloat16 and not scaler.is_enabled():
+                        loss.backward()
+                    else:
+                        scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
-            # Profile optimizer step
             with profiler.timer('optimizer_step'):
-                # Gradient accumulation step
                 if (i + 1) % gradient_accumulation_steps == 0:
                     if use_mixed_precision:
                         scaler.step(optimizer_ddpm)
@@ -398,12 +398,20 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
                     optimizer_ddpm.zero_grad()
                     optimizer_seg.zero_grad()
 
-            train_loss += loss.item() * gradient_accumulation_steps  # Scale back for logging
+            train_loss += loss.item() * gradient_accumulation_steps
             tbar.set_description('Epoch:%d, Train loss: %.3f' % (epoch, train_loss))
+            
+            if epoch == 0 and i % 10 == 0 and torch.cuda.is_available():
+                allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+                reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+                tbar.set_postfix({
+                    'VRAM': f'{allocated_gb:.1f}GB/{reserved_gb:.1f}GB',
+                    'Batch': f'{i+1}/{len(training_dataset_loader)}'
+                })
 
             train_smL1_loss += smL1_loss.item()
-            train_focal_loss+=5*focal_loss.item()
-            train_noise_loss+=noise_loss.item()
+            train_focal_loss += 5 * focal_loss.item()
+            train_noise_loss += noise_loss.item()
             
             # Log batch metrics
             batch_time = time.time() - batch_start_time
@@ -419,40 +427,40 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
                 batch_time=batch_time
             )
             
-        # Record epoch time
         epoch_time = time.time() - epoch_start_time
         epoch_times.append(epoch_time)
         
-        # Log system metrics and monitor resources
         profiler.log_system_metrics()
         profiler.log_training_metrics(epoch=epoch, batch_idx=0, losses={}, epoch_time=epoch_time)
         
-        # Monitor system resources periodically
         if epoch % resource_monitor_interval == 0 and epoch > 0:
             resource_info = monitor_system_resources()
             avg_epoch_time = np.mean(epoch_times[-resource_monitor_interval:]) if len(epoch_times) >= resource_monitor_interval else np.mean(epoch_times)
             print(f"Epoch {epoch} | {resource_info} | Avg Epoch Time: {avg_epoch_time:.2f}s")
             
-            # Check for bottlenecks
+            if torch.cuda.is_available():
+                print("\n" + "="*60)
+                print(f"MEMORY DIAGNOSTICS - Epoch {epoch}")
+                print("="*60)
+                print(torch.cuda.memory_summary(device=device, abbreviated=False))
+                print("="*60 + "\n")
+            
             bottlenecks = profiler.detect_bottlenecks()
             if bottlenecks:
-                print("⚠️  Performance bottlenecks detected:")
+                print("Performance bottlenecks detected:")
                 for bottleneck in bottlenecks:
                     print(f"   - {bottleneck}")
             
-            # Clear GPU cache periodically
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 gc.collect()
 
-        # Save losses every epoch (always track progress)
         train_loss_list.append(round(train_loss,3))
         train_smL1_loss_list.append(round(train_smL1_loss,3))
         train_focal_loss_list.append(round(train_focal_loss,3))
         train_noise_loss_list.append(round(train_noise_loss,3))
         loss_x_list.append(int(epoch))
         
-        # Update global variables for signal handler
         current_training_data.update({
             'train_loss_list': train_loss_list,
             'train_noise_loss_list': train_noise_loss_list,
@@ -461,18 +469,15 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
             'loss_x_list': loss_x_list
         })
         
-        # Plot learning curves every epoch for first 10 epochs, then every 10 epochs
         if epoch < 10 or epoch % 10 == 0:
             plot_learning_curves(train_loss_list, train_noise_loss_list, train_focal_loss_list, 
                                 train_smL1_loss_list, loss_x_list, image_auroc_list, 
                                 pixel_auroc_list, performance_x_list, sub_class, args, inline=use_inline_plots)
 
-        # Check if this is the best loss so far
         if train_loss < best_loss:
             best_loss = train_loss
             best_epoch = epoch
             
-            # Save best model
             best_history = {
                 'train_loss_list': train_loss_list,
                 'train_noise_loss_list': train_noise_loss_list,
@@ -483,9 +488,8 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
                 'best_epoch': best_epoch
             }
             save(unet_model, seg_model, args=args, final='best', epoch=epoch, sub_class=sub_class, training_history=best_history)
-            print(f"🏆 New best loss: {best_loss:.4f} at epoch {epoch + 1} - Best model saved!")
+            print(f"New best loss: {best_loss:.4f} at epoch {epoch + 1} - Best model saved!")
 
-        # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             checkpoint_history = {
                 'train_loss_list': train_loss_list,
@@ -497,12 +501,9 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
                 'best_epoch': best_epoch
             }
             save(unet_model, seg_model, args=args, final='last', epoch=epoch, sub_class=sub_class, training_history=checkpoint_history)
-            print(f"💾 Checkpoint saved at epoch {epoch + 1}")
-
-        # Skip evaluation during training - focus only on loss
-                
+            print(f"Checkpoint saved at epoch {epoch + 1}")
             
-    # Save final checkpoint with training history (loss only)
+    # Save final checkpoint
     final_training_history = {
         'train_loss_list': train_loss_list,
         'train_noise_loss_list': train_noise_loss_list,
@@ -513,10 +514,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
         'best_epoch': best_epoch
     }
     save(unet_model,seg_model, args=args,final='last',epoch=args['EPOCHS']-1,sub_class=sub_class, training_history=final_training_history)
-
-    # Skip final plot to save memory
     
-    # Save training statistics (loss-focused)
     final_loss = train_loss_list[-1] if train_loss_list else 0
     training_stats = {
         'total_epochs': len(train_loss_list),
@@ -530,7 +528,6 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     with open(f'{args["output_path"]}/metrics/ARGS={args["arg_num"]}/{sub_class}_training_stats.json', 'w') as f:
         json.dump(training_stats, f, indent=2)
 
-    # Save profiler results (text only, no plots)
     profiler.print_summary()
     profiler.save_stats()
    
@@ -603,20 +600,14 @@ def main():
 
         data_len = len(testing_dataset)
         
-        # Check if test dataset is empty
         if data_len == 0:
-            print(f"⚠️  WARNING: Test dataset for {sub_class} is empty!")
-            print(f"   - Training will continue but no evaluation will be performed")
-            print(f"   - Check data path: {args['data_root_path']}/{args['data_name']}/{sub_class}")
+            print(f"WARNING: Test dataset for {sub_class} is empty!")
+            print(f"Training will continue but no evaluation will be performed")
         
-        # Calculate effective batch size considering multi-GPU and gradient accumulation
         base_batch_size = args['Batch_Size']
         gradient_accumulation_steps = args.get('gradient_accumulation_steps', 1)
         
-        # For DataLoader, we use the base batch size
         dataloader_batch_size = base_batch_size
-            
-        # Total effective batch size
         total_effective_batch_size = dataloader_batch_size * gradient_accumulation_steps
         
         print(f"Batch size configuration:")
@@ -625,8 +616,6 @@ def main():
         print(f"  - Gradient accumulation steps: {gradient_accumulation_steps}")
         print(f"  - Total effective batch size: {total_effective_batch_size}")
 
-        
-        # Optimize DataLoader settings
         optimal_num_workers = min(8, os.cpu_count() // 2) if os.cpu_count() else 4
         print(f"Using {optimal_num_workers} workers for data loading")
         
@@ -637,8 +626,8 @@ def main():
             num_workers=optimal_num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,  # Keep workers alive between epochs
-            prefetch_factor=2  # Prefetch 2 batches per worker
+            persistent_workers=True,
+            prefetch_factor=2
         )
         test_loader = DataLoader(
             testing_dataset, 
