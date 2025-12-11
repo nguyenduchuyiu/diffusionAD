@@ -456,9 +456,18 @@ class RealIADTrainDataset(Dataset):
         self.root_dir = os.path.join(data_path, 'train', 'good')
         self.resize_shape = [img_size[0], img_size[1]]
         self.anomaly_source_path = args["anomaly_source_path"]
+        # Hỗ trợ nhiều định dạng ảnh, không chỉ .jpg
+        IMAGE_EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.tif", "*.webp"]
+        self.image_paths = []
+        for ext in IMAGE_EXTENSIONS:
+            self.image_paths.extend(glob.glob(os.path.join(self.root_dir, ext)))
+        self.image_paths = sorted(self.image_paths)
 
-        self.image_paths = sorted(glob.glob(self.root_dir + "/*.jpg"))
-        self.anomaly_source_paths = sorted(glob.glob(self.anomaly_source_path + "/images/*/*.jpg"))
+        self.anomaly_source_paths = []
+        anomaly_glob_path = os.path.join(self.anomaly_source_path, "images", "*")
+        for ext in IMAGE_EXTENSIONS:
+            self.anomaly_source_paths.extend(glob.glob(os.path.join(anomaly_glob_path, ext)))
+        self.anomaly_source_paths = sorted(self.anomaly_source_paths)
         
         # Cache for preprocessed data
         self._image_cache = {}
