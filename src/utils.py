@@ -496,12 +496,21 @@ class RealIADTrainDataset(Dataset):
     
     def get_foreground(self, image_path):
         foreground_path = image_path.replace('train', 'DISthresh')
-        # Thêm _mask vào tên file
         base_name = os.path.basename(foreground_path)
         name_without_ext = os.path.splitext(base_name)[0]
-        mask_name = f"{name_without_ext}_mask.jpg"
-        foreground_path = os.path.join(os.path.dirname(foreground_path), mask_name)
-        return foreground_path
+        dir_path = os.path.dirname(foreground_path)
+        
+        # Thử PNG trước, sau đó JPG
+        mask_path_png = os.path.join(dir_path, f"{name_without_ext}_mask.png")
+        mask_path_jpg = os.path.join(dir_path, f"{name_without_ext}_mask.jpg")
+        
+        if os.path.exists(mask_path_png):
+            return mask_path_png
+        elif os.path.exists(mask_path_jpg):
+            return mask_path_jpg
+        else:
+            # Trả về PNG mặc định (sẽ được xử lý trong _load_and_cache_thresh)
+            return mask_path_png
 
     def randAugmenter(self):
         aug_ind = np.random.choice(np.arange(len(self.augmenters)), 3, replace=False)
