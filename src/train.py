@@ -247,7 +247,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     use_mixed_precision = args.get('use_mixed_precision', True) and torch.cuda.is_available()
     use_bfloat16 = args.get('use_bfloat16', True) and torch.cuda.is_available()
     if use_mixed_precision:
-        scaler = GradScaler(device_type='cuda', enabled=(not use_bfloat16))
+        scaler = GradScalenabled=(not use_bfloat16)
     else:
         scaler = None
     
