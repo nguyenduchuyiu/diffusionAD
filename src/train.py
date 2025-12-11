@@ -137,36 +137,7 @@ def is_jupyter_environment():
         return False
 
 def signal_handler(signum, frame):
-    print(f"\nTraining interrupted! Saving checkpoint...")
-    
-    try:
-        if 'current_models' in globals() and 'current_training_data' in globals():
-            unet_model, seg_model = current_models
-            args = current_args
-            sub_class = current_sub_class
-            training_data = current_training_data
-            
-            interrupt_history = {
-                'train_loss_list': training_data['train_loss_list'],
-                'train_noise_loss_list': training_data['train_noise_loss_list'],
-                'train_focal_loss_list': training_data['train_focal_loss_list'],
-                'train_smL1_loss_list': training_data['train_smL1_loss_list'],
-                'loss_x_list': training_data['loss_x_list']
-            }
-            
-            current_epoch = training_data['loss_x_list'][-1] if training_data['loss_x_list'] else 0
-            save(unet_model, seg_model, args=args, final='last', epoch=current_epoch, 
-                 sub_class=sub_class, training_history=interrupt_history)
-            
-            print(f"Emergency checkpoint saved at epoch {current_epoch + 1}")
-            print(f"You can resume training by setting 'resume_training': true")
-        else:
-            print("No training data to save")
-            
-    except Exception as e:
-        print(f"Error saving checkpoint: {e}")
-    
-    print("Exiting...")
+    print("\nTraining interrupted by user. No checkpoint saved (requested).")
     sys.exit(0)
 
 def monitor_system_resources():
@@ -477,32 +448,6 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
         if train_loss < best_loss:
             best_loss = train_loss
             best_epoch = epoch
-            
-            best_history = {
-                'train_loss_list': train_loss_list,
-                'train_noise_loss_list': train_noise_loss_list,
-                'train_focal_loss_list': train_focal_loss_list,
-                'train_smL1_loss_list': train_smL1_loss_list,
-                'loss_x_list': loss_x_list,
-                'best_loss': best_loss,
-                'best_epoch': best_epoch
-            }
-            save(unet_model, seg_model, args=args, final='best', epoch=epoch, sub_class=sub_class, training_history=best_history)
-            print(f"New best loss: {best_loss:.4f} at epoch {epoch + 1} - Best model saved!")
-
-        if (epoch + 1) % 10 == 0:
-            checkpoint_history = {
-                'train_loss_list': train_loss_list,
-                'train_noise_loss_list': train_noise_loss_list,
-                'train_focal_loss_list': train_focal_loss_list,
-                'train_smL1_loss_list': train_smL1_loss_list,
-                'loss_x_list': loss_x_list,
-                'best_loss': best_loss,
-                'best_epoch': best_epoch
-            }
-            save(unet_model, seg_model, args=args, final='last', epoch=epoch, sub_class=sub_class, training_history=checkpoint_history)
-            print(f"Checkpoint saved at epoch {epoch + 1}")
-            
     # Save final checkpoint
     final_training_history = {
         'train_loss_list': train_loss_list,
