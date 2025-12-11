@@ -448,6 +448,30 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
         if train_loss < best_loss:
             best_loss = train_loss
             best_epoch = epoch
+            best_history = {
+                'train_loss_list': train_loss_list,
+                'train_noise_loss_list': train_noise_loss_list,
+                'train_focal_loss_list': train_focal_loss_list,
+                'train_smL1_loss_list': train_smL1_loss_list,
+                'loss_x_list': loss_x_list,
+                'best_loss': best_loss,
+                'best_epoch': best_epoch
+            }
+            save(unet_model, seg_model, args=args, final='best', epoch=epoch, sub_class=sub_class, training_history=best_history)
+            print(f"New best loss: {best_loss:.4f} at epoch {epoch + 1} - Best model saved!")
+
+        if (epoch + 1) % 100 == 0:
+            checkpoint_history = {
+                'train_loss_list': train_loss_list,
+                'train_noise_loss_list': train_noise_loss_list,
+                'train_focal_loss_list': train_focal_loss_list,
+                'train_smL1_loss_list': train_smL1_loss_list,
+                'loss_x_list': loss_x_list,
+                'best_loss': best_loss,
+                'best_epoch': best_epoch
+            }
+            save(unet_model, seg_model, args=args, final='last', epoch=epoch, sub_class=sub_class, training_history=checkpoint_history)
+            print(f"Checkpoint saved at epoch {epoch + 1}")
     # Save final checkpoint
     final_training_history = {
         'train_loss_list': train_loss_list,
