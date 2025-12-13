@@ -23,7 +23,7 @@ import time
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 try:
-    from inference import preprocess_image, predict, load_checkpoint, defaultdict_from_json, denormalize_image, min_max_norm, cvt2heatmap, show_cam_on_image, predict_batch
+    from inference import preprocess_image, predict, load_checkpoint, defaultdict_from_json, denormalize_image, min_max_norm, cvt2heatmap, show_cam_on_image, predict_batch, predict_single_image_array
     from models import UNetModel, SegmentationSubNetwork, GaussianDiffusionModel, get_beta_schedule
 except ImportError as e:
     st.error(f"Failed to import modules: {e}")
@@ -165,91 +165,8 @@ def predict_single_image(models, image_array, heatmap_threshold=0.6):
     args = models['args']
     device = models['device']
     
-    # Preprocess image
-    if len(image_array.shape) == 3:
-        image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
-    else:
-        raise ValueError("Image must be 3D array (H, W, C)")
-    
-    # Resize to model input size
-    image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
-    image_tensor = image_tensor.to(device)
-
-    normal_t = args["eval_normal_t"]
-    noiser_t = args["eval_noisier_t"]
-    
-    normal_t_tensor = torch.tensor([normal_t], device=device).repeat(image_tensor.shape[0])
-    noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(image_tensor.shape[0])
-
-    # Measure inference time
-    inference_start = time.time()
-    with torch.no_grad():
-        _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
-        pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
-    inference_time = time.time() - inference_start
-            
-    pred_mask = torch.sigmoid(pred_mask_logits)
-    out_mask = pred_mask
-
-    # Calculate anomaly score
-    topk_out_mask = torch.flatten(out_mask[0], start_dim=1)
-    topk_out_mask = torch.topk(topk_out_mask, 50, dim=1, largest=True)[0]
-    image_score = torch.mean(topk_out_mask).cpu().item()
-
-    # Create visualizations
-    # Original image: convert from [0, 1] directly to [0, 255] (not [-1, 1])
-    raw_image_np = image_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy()
-    raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
-    
-    # Reconstructed images: use denormalize (model outputs are in [-1, 1])
-    recon_condition = denormalize_image(pred_x_0_condition)
-    recon_noisier_t = denormalize_image(pred_x_0_noisier)
-    
-    # Create heatmap with higher contrast
-    mask_data = out_mask[0, 0].cpu().numpy().astype(np.float32)
-    mask_data[mask_data < heatmap_threshold] = 0
-    
-    # Apply contrast enhancement using gamma correction
-    gamma = 0.1  # Lower gamma = higher contrast for bright areas
-    mask_data_enhanced = np.power(mask_data, gamma)
-    
-    ano_map = cv2.GaussianBlur(mask_data_enhanced, (15, 15), 4)
-    ano_map = min_max_norm(ano_map)
-    
-    # Use HOT colormap for better visibility (red/yellow/white)
-    ano_map_heatmap = cv2.applyColorMap(np.uint8(ano_map * 255.0), cv2.COLORMAP_HOT)
-    
-    # Create overlay
-    raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
-    ano_map_overlay = show_cam_on_image(raw_image_bgr, ano_map_heatmap)
-    ano_map_overlay = cv2.cvtColor(ano_map_overlay, cv2.COLOR_BGR2RGB)
-    
-    # Create enhanced anomaly mask with high contrast
-    mask_raw = out_mask[0][0].cpu().numpy().astype(np.float32)
-    # Apply threshold to remove low values
-    mask_raw[mask_raw < heatmap_threshold] = 0
-    # Apply gamma correction for contrast enhancement
-    mask_enhanced = np.power(mask_raw, 0.3)
-    # Normalize to full range [0, 1]
-    mask_normalized = min_max_norm(mask_enhanced)
-    # Apply contrast stretching - map to full [0, 255] range
-    mask_stretched = (mask_normalized * 255.0).astype(np.uint8)
-    # Apply colormap for better visibility (HOT: black->red->yellow->white)
-    anomaly_mask_colored = cv2.applyColorMap(mask_stretched, cv2.COLORMAP_HOT)
-    # Convert BGR to RGB for display
-    anomaly_mask_colored = cv2.cvtColor(anomaly_mask_colored, cv2.COLOR_BGR2RGB)
-    
-    return {
-        "anomaly_score": float(image_score),
-        "is_anomaly": image_score > heatmap_threshold,
-        "original_image": raw_image,
-        "reconstructed_image": recon_condition,
-        "recon_noisier": recon_noisier_t,
-        "anomaly_mask": anomaly_mask_colored,
-        "heatmap_overlay": ano_map_overlay,
-        "heatmap": ano_map,
-        "inference_time": inference_time
-    }
+    # Use the function from inference.py
+    return predict_single_image_array(unet_model, seg_model, ddpm, image_array, args, device, heatmap_threshold)
 
 def predict_batch_images(models, image_arrays, batch_size=8, heatmap_threshold=0.6, progress_bar=None, status_text=None):
     """Predict anomalies for a batch of images with parallel processing"""

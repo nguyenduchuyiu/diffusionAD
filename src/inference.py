@@ -123,22 +123,32 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
     image_score = torch.mean(topk_out_mask)
 
     # --- Visualisation ---
-    raw_image = denormalize_image(image_tensor)
+    # Original image: convert from [0, 1] directly to [0, 255] (not [-1, 1])
+    raw_image_np = image_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy()
+    raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+    
+    # Reconstructed images: use denormalize (model outputs are in [-1, 1])
     recon_condition = denormalize_image(pred_x_0_condition)
     recon_normal_t = denormalize_image(pred_x_0_normal)
     recon_noisier_t = denormalize_image(pred_x_0_noisier)
     
-    # Tạo heatmap
+    # Create heatmap with higher contrast
     mask_data = out_mask[0, 0].cpu().numpy().astype(np.float32)
     mask_data[mask_data < heatmap_threshold] = 0
-    ano_map = cv2.GaussianBlur(mask_data, (15, 15), 4)
-    ano_map = min_max_norm(ano_map)
-    ano_map_heatmap = cvt2heatmap(ano_map * 255.0)
     
-    # Chuyển raw_image sang BGR để overlay
+    # Apply contrast enhancement using gamma correction
+    gamma = 0.1  # Lower gamma = higher contrast for bright areas
+    mask_data_enhanced = np.power(mask_data, gamma)
+    
+    ano_map = cv2.GaussianBlur(mask_data_enhanced, (15, 15), 4)
+    ano_map = min_max_norm(ano_map)
+    
+    # Use HOT colormap for better visibility (red/yellow/white)
+    ano_map_heatmap = cv2.applyColorMap(np.uint8(ano_map * 255.0), cv2.COLORMAP_HOT)
+    
+    # Create overlay
     raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
     ano_map_overlay = show_cam_on_image(raw_image_bgr, ano_map_heatmap)
-    # Chuyển lại RGB để matplotlib hiển thị đúng
     ano_map_overlay = cv2.cvtColor(ano_map_overlay, cv2.COLOR_BGR2RGB)
     
     # Hiển thị
@@ -157,7 +167,16 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
     axes[2].set_title('Recon (Noisier)')
     axes[2].axis('off')
     
-    axes[3].imshow((out_mask[0][0].cpu().numpy() * 255.0).astype(np.uint8), cmap='gray')
+    # Create enhanced anomaly mask with high contrast
+    mask_raw = out_mask[0][0].cpu().numpy().astype(np.float32)
+    mask_raw[mask_raw < heatmap_threshold] = 0
+    mask_enhanced = np.power(mask_raw, 0.3)
+    mask_normalized = min_max_norm(mask_enhanced)
+    mask_stretched = (mask_normalized * 255.0).astype(np.uint8)
+    anomaly_mask_colored = cv2.applyColorMap(mask_stretched, cv2.COLORMAP_HOT)
+    anomaly_mask_colored = cv2.cvtColor(anomaly_mask_colored, cv2.COLOR_BGR2RGB)
+    
+    axes[3].imshow(anomaly_mask_colored)
     axes[3].set_title('Anomaly Mask')
     axes[3].axis('off')
 
@@ -312,31 +331,84 @@ def predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, devic
     
     if return_visualizations:
         # Create visualizations
-        raw_image = denormalize_image(image_tensor)
+        # Original image: convert from [0, 1] directly to [0, 255] (not [-1, 1])
+        raw_image_np = image_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy()
+        raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+        
+        # Reconstructed images: use denormalize (model outputs are in [-1, 1])
         recon_condition = denormalize_image(pred_x_0_condition)
         recon_noisier_t = denormalize_image(pred_x_0_noisier)
         
-        # Create heatmap
+        # Create heatmap with higher contrast
         mask_data = out_mask[0, 0].cpu().numpy().astype(np.float32)
         mask_data[mask_data < heatmap_threshold] = 0
-        ano_map = cv2.GaussianBlur(mask_data, (15, 15), 4)
+        
+        # Apply contrast enhancement using gamma correction
+        gamma = 0.1  # Lower gamma = higher contrast for bright areas
+        mask_data_enhanced = np.power(mask_data, gamma)
+        
+        ano_map = cv2.GaussianBlur(mask_data_enhanced, (15, 15), 4)
         ano_map = min_max_norm(ano_map)
-        ano_map_heatmap = cvt2heatmap(ano_map * 255.0)
+        
+        # Use HOT colormap for better visibility (red/yellow/white)
+        ano_map_heatmap = cv2.applyColorMap(np.uint8(ano_map * 255.0), cv2.COLORMAP_HOT)
         
         # Create overlay
         raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
         ano_map_overlay = show_cam_on_image(raw_image_bgr, ano_map_heatmap)
         ano_map_overlay = cv2.cvtColor(ano_map_overlay, cv2.COLOR_BGR2RGB)
         
+        # Create enhanced anomaly mask with high contrast
+        mask_raw = out_mask[0][0].cpu().numpy().astype(np.float32)
+        mask_raw[mask_raw < heatmap_threshold] = 0
+        mask_enhanced = np.power(mask_raw, 0.3)
+        mask_normalized = min_max_norm(mask_enhanced)
+        mask_stretched = (mask_normalized * 255.0).astype(np.uint8)
+        anomaly_mask_colored = cv2.applyColorMap(mask_stretched, cv2.COLORMAP_HOT)
+        anomaly_mask_colored = cv2.cvtColor(anomaly_mask_colored, cv2.COLOR_BGR2RGB)
+        
         result.update({
             "original_image": raw_image,
             "reconstructed_image": recon_condition,
             "recon_noisier": recon_noisier_t,
-            "anomaly_mask": (out_mask[0][0].cpu().numpy() * 255.0).astype(np.uint8),
+            "anomaly_mask": anomaly_mask_colored,
             "heatmap_overlay": ano_map_overlay,
             "heatmap": ano_map
         })
     
+    return result
+
+def predict_single_image_array(unet_model, seg_model, ddpm, image_array, args, device='cpu', heatmap_threshold=0.6):
+    """
+    Predict anomaly for a single image array (numpy array)
+    Args:
+        unet_model: UNet model
+        seg_model: Segmentation model
+        ddpm: DDPM model
+        image_array: numpy array of shape (H, W, C) with values in [0, 255]
+        args: Model arguments
+        device: Device to run on
+        heatmap_threshold: Threshold for anomaly detection
+    Returns:
+        Dictionary with prediction results and visualizations
+    """
+    import time
+    
+    # Preprocess image
+    if len(image_array.shape) == 3:
+        image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+    else:
+        raise ValueError("Image must be 3D array (H, W, C)")
+    
+    # Resize to model input size
+    image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
+    
+    # Measure inference time
+    inference_start = time.time()
+    result = predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, device, heatmap_threshold, return_visualizations=True)
+    inference_time = time.time() - inference_start
+    
+    result['inference_time'] = inference_time
     return result
 
 if __name__ == "__main__":
@@ -345,7 +417,7 @@ if __name__ == "__main__":
     device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    ckpt_path = "outputs/model/params-last.pt"
+    ckpt_path = "outputs/model/diff-params-ARGS=1/PCB5/params-last.pt"
     image_path = "datasets/RealIAD/PCB5/test/bad/pcb_0001_NG_HS_C1_20231028093757.jpg"
     heatmap_threshold = 0.5
     # 1. Load checkpoint và lấy args từ đó
