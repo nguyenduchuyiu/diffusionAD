@@ -11,7 +11,6 @@ import torch.nn as nn
 from models import UNetModel, update_ema_params
 from models import SegmentationSubNetwork
 import torch.nn as nn
-from torch.amp import autocast
 from utils import RealIADTestDataset
 from models import GaussianDiffusionModel, get_beta_schedule
 from math import exp
@@ -29,18 +28,36 @@ from skimage.measure import label, regionprops
 import sys
 from utils import BinaryFocalLoss
 
-def preprocess_image(image_path, img_size=(256, 256)):
-    image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
-    image = cv2.resize(image, (img_size[1], img_size[0]))
-    image = (image / 255.0)
-    image = np.transpose(image.astype(np.float32), (2, 0, 1))
-    image = torch.from_numpy(image).unsqueeze(0)
+def preprocess_image(image_path, img_size=(256, 256), channels=3):
+    image = cv2.imread(image_path)
+    if channels == 1:
+        # Convert to grayscale
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = cv2.resize(image, (img_size[1], img_size[0]))
+        image = (image / 255.0).astype(np.float32)
+        image = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    else:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (img_size[1], img_size[0]))
+        image = (image / 255.0)
+        image = np.transpose(image.astype(np.float32), (2, 0, 1))
+        image = torch.from_numpy(image).unsqueeze(0)  # (1, 3, H, W)
     return image
 
 def denormalize_image(tensor_image):
-    img_np = tensor_image.cpu().squeeze(0).permute(1, 2, 0).numpy()
+    img = tensor_image.cpu().squeeze(0)
+    if img.dim() == 2:  # Grayscale (H, W)
+        img_np = img.numpy()
+    elif img.shape[0] == 1:  # Grayscale (1, H, W)
+        img_np = img.squeeze(0).numpy()
+    else:  # RGB (C, H, W)
+        img_np = img.permute(1, 2, 0).numpy()
     img_np = (img_np + 1) / 2.0
+    img_np = np.nan_to_num(img_np, nan=0.0, posinf=1.0, neginf=0.0)
     img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+    # Convert grayscale to RGB for display
+    if len(img_np.shape) == 2:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
     return img_np
 
 def gridify_output(img, row_size=-1):
@@ -83,12 +100,16 @@ def cvt2heatmap(gray):
     return heatmap
 def show_cam_on_image(img, anomaly_map):
     cam = np.float32(anomaly_map)/255 + np.float32(img)/255
-    cam = cam / np.max(cam)
+    max_val = np.max(cam)
+    if max_val > 0:
+        cam = cam / max_val
     return np.uint8(255 * cam) 
 
 
 def min_max_norm(image):
     a_min, a_max = image.min(), image.max()
+    if a_max - a_min == 0:
+        return np.zeros_like(image)
     return (image-a_min)/(a_max - a_min)
 
         
@@ -105,14 +126,8 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
     noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(image_tensor.shape[0])
 
     with torch.no_grad():
-        use_mixed_precision = torch.cuda.is_available() and device.type == 'cuda'
-        if use_mixed_precision:
-            with autocast('cuda'):
-                _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
-                pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
-        else:
-            _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
-            pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+        _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
+        pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
             
     pred_mask = torch.sigmoid(pred_mask_logits)
     out_mask = pred_mask
@@ -124,8 +139,14 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
 
     # --- Visualisation ---
     # Original image: convert from [0, 1] directly to [0, 255] (not [-1, 1])
-    raw_image_np = image_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy()
-    raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+    img = image_tensor.cpu().squeeze(0)
+    if img.shape[0] == 1:  # Grayscale (1, H, W)
+        raw_image_np = img.squeeze(0).numpy()
+        raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+        raw_image = cv2.cvtColor(raw_image, cv2.COLOR_GRAY2RGB)
+    else:  # RGB (C, H, W)
+        raw_image_np = img.permute(1, 2, 0).numpy()
+        raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
     
     # Reconstructed images: use denormalize (model outputs are in [-1, 1])
     recon_condition = denormalize_image(pred_x_0_condition)
@@ -138,13 +159,14 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
     
     # Apply contrast enhancement using gamma correction
     gamma = 0.1  # Lower gamma = higher contrast for bright areas
-    mask_data_enhanced = np.power(mask_data, gamma)
+    mask_data_enhanced = np.power(np.clip(mask_data, 0, 1), gamma)
     
     ano_map = cv2.GaussianBlur(mask_data_enhanced, (15, 15), 4)
     ano_map = min_max_norm(ano_map)
+    ano_map = np.nan_to_num(ano_map, nan=0.0)
     
     # Use HOT colormap for better visibility (red/yellow/white)
-    ano_map_heatmap = cv2.applyColorMap(np.uint8(ano_map * 255.0), cv2.COLORMAP_HOT)
+    ano_map_heatmap = cv2.applyColorMap(np.uint8(np.clip(ano_map * 255.0, 0, 255)), cv2.COLORMAP_HOT)
     
     # Create overlay
     raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
@@ -170,9 +192,10 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
     # Create enhanced anomaly mask with high contrast
     mask_raw = out_mask[0][0].cpu().numpy().astype(np.float32)
     mask_raw[mask_raw < heatmap_threshold] = 0
-    mask_enhanced = np.power(mask_raw, 0.3)
+    mask_enhanced = np.power(np.clip(mask_raw, 0, 1), 0.3)
     mask_normalized = min_max_norm(mask_enhanced)
-    mask_stretched = (mask_normalized * 255.0).astype(np.uint8)
+    mask_normalized = np.nan_to_num(mask_normalized, nan=0.0)
+    mask_stretched = np.uint8(np.clip(mask_normalized * 255.0, 0, 255))
     anomaly_mask_colored = cv2.applyColorMap(mask_stretched, cv2.COLORMAP_HOT)
     anomaly_mask_colored = cv2.cvtColor(anomaly_mask_colored, cv2.COLOR_BGR2RGB)
     
@@ -188,7 +211,7 @@ def predict(unet_model, seg_model, ddpm, image_tensor, args, device='cpu', heatm
     plt.show()
 
 def predict_image(unet_model, seg_model, ddpm, image_path, args, device='cpu', heatmap_threshold=0.6):
-    image_tensor = preprocess_image(image_path, img_size=args['img_size'])
+    image_tensor = preprocess_image(image_path, img_size=args['img_size'], channels=args['channels'])
     image_tensor = image_tensor.to(device)
     return predict(unet_model, seg_model, ddpm, image_tensor, args, device, heatmap_threshold)
 
@@ -227,9 +250,16 @@ def predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device='cpu',
         batch_tensors = []
         for image_array in batch_images:
             if len(image_array.shape) == 3:
-                image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+                # Check if model expects grayscale
+                if args.get('channels', 3) == 1:
+                    gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+                    image_tensor = torch.from_numpy(gray.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+                else:
+                    image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+            elif len(image_array.shape) == 2:
+                image_tensor = torch.from_numpy(image_array.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
             else:
-                raise ValueError("Image must be 3D array (H, W, C)")
+                raise ValueError("Image must be 2D (H, W) or 3D array (H, W, C)")
             
             # Resize to model input size
             image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
@@ -251,14 +281,8 @@ def predict_batch(unet_model, seg_model, ddpm, image_arrays, args, device='cpu',
         # Measure inference time for batch - all images processed in parallel
         inference_start = time.time()
         with torch.no_grad():
-            use_mixed_precision = torch.cuda.is_available() and device.type == 'cuda'
-            if use_mixed_precision:
-                with autocast('cuda'):
-                    _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, batch_tensor, normal_t_tensor, noiser_t_tensor, args)
-                    pred_mask_logits = seg_model(torch.cat((batch_tensor, pred_x_0_condition), dim=1))
-            else:
-                _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, batch_tensor, normal_t_tensor, noiser_t_tensor, args)
-                pred_mask_logits = seg_model(torch.cat((batch_tensor, pred_x_0_condition), dim=1))
+            _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, batch_tensor, normal_t_tensor, noiser_t_tensor, args)
+            pred_mask_logits = seg_model(torch.cat((batch_tensor, pred_x_0_condition), dim=1))
         
         # Synchronize GPU after inference (for accurate timing)
         if device.type == 'cuda':
@@ -307,14 +331,8 @@ def predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, devic
     noiser_t_tensor = torch.tensor([noiser_t], device=device).repeat(image_tensor.shape[0])
 
     with torch.no_grad():
-        use_mixed_precision = torch.cuda.is_available() and device.type == 'cuda'
-        if use_mixed_precision:
-            with autocast('cuda'):
-                _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
-                pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
-        else:
-            _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
-            pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
+        _, pred_x_0_condition, pred_x_0_normal, pred_x_0_noisier, x_normal_t, x_noiser_t, pred_x_t_noisier = ddpm.norm_guided_one_step_denoising_eval(unet_model, image_tensor, normal_t_tensor, noiser_t_tensor, args)
+        pred_mask_logits = seg_model(torch.cat((image_tensor, pred_x_0_condition), dim=1))
             
     pred_mask = torch.sigmoid(pred_mask_logits)
     out_mask = pred_mask
@@ -332,8 +350,14 @@ def predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, devic
     if return_visualizations:
         # Create visualizations
         # Original image: convert from [0, 1] directly to [0, 255] (not [-1, 1])
-        raw_image_np = image_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy()
-        raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+        img = image_tensor.cpu().squeeze(0)
+        if img.shape[0] == 1:  # Grayscale (1, H, W)
+            raw_image_np = img.squeeze(0).numpy()
+            raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
+            raw_image = cv2.cvtColor(raw_image, cv2.COLOR_GRAY2RGB)
+        else:  # RGB (C, H, W)
+            raw_image_np = img.permute(1, 2, 0).numpy()
+            raw_image = np.clip(raw_image_np * 255.0, 0, 255).astype(np.uint8)
         
         # Reconstructed images: use denormalize (model outputs are in [-1, 1])
         recon_condition = denormalize_image(pred_x_0_condition)
@@ -345,13 +369,14 @@ def predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, devic
         
         # Apply contrast enhancement using gamma correction
         gamma = 0.1  # Lower gamma = higher contrast for bright areas
-        mask_data_enhanced = np.power(mask_data, gamma)
+        mask_data_enhanced = np.power(np.clip(mask_data, 0, 1), gamma)
         
         ano_map = cv2.GaussianBlur(mask_data_enhanced, (15, 15), 4)
         ano_map = min_max_norm(ano_map)
+        ano_map = np.nan_to_num(ano_map, nan=0.0)
         
         # Use HOT colormap for better visibility (red/yellow/white)
-        ano_map_heatmap = cv2.applyColorMap(np.uint8(ano_map * 255.0), cv2.COLORMAP_HOT)
+        ano_map_heatmap = cv2.applyColorMap(np.uint8(np.clip(ano_map * 255.0, 0, 255)), cv2.COLORMAP_HOT)
         
         # Create overlay
         raw_image_bgr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
@@ -361,9 +386,10 @@ def predict_single_tensor(unet_model, seg_model, ddpm, image_tensor, args, devic
         # Create enhanced anomaly mask with high contrast
         mask_raw = out_mask[0][0].cpu().numpy().astype(np.float32)
         mask_raw[mask_raw < heatmap_threshold] = 0
-        mask_enhanced = np.power(mask_raw, 0.3)
+        mask_enhanced = np.power(np.clip(mask_raw, 0, 1), 0.3)
         mask_normalized = min_max_norm(mask_enhanced)
-        mask_stretched = (mask_normalized * 255.0).astype(np.uint8)
+        mask_normalized = np.nan_to_num(mask_normalized, nan=0.0)
+        mask_stretched = np.uint8(np.clip(mask_normalized * 255.0, 0, 255))
         anomaly_mask_colored = cv2.applyColorMap(mask_stretched, cv2.COLORMAP_HOT)
         anomaly_mask_colored = cv2.cvtColor(anomaly_mask_colored, cv2.COLOR_BGR2RGB)
         
@@ -396,9 +422,18 @@ def predict_single_image_array(unet_model, seg_model, ddpm, image_array, args, d
     
     # Preprocess image
     if len(image_array.shape) == 3:
-        image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+        # Check if model expects grayscale
+        if args.get('channels', 3) == 1:
+            # Convert RGB to grayscale
+            gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+            image_tensor = torch.from_numpy(gray.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        else:
+            image_tensor = torch.from_numpy(np.transpose(image_array.astype(np.float32) / 255.0, (2, 0, 1))).unsqueeze(0)
+    elif len(image_array.shape) == 2:
+        # Already grayscale
+        image_tensor = torch.from_numpy(image_array.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
     else:
-        raise ValueError("Image must be 3D array (H, W, C)")
+        raise ValueError("Image must be 2D (H, W) or 3D array (H, W, C)")
     
     # Resize to model input size
     image_tensor = torch.nn.functional.interpolate(image_tensor, size=args['img_size'], mode='bilinear', align_corners=False)
@@ -413,19 +448,20 @@ def predict_single_image_array(unet_model, seg_model, ddpm, image_array, args, d
 
 if __name__ == "__main__":
     
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    ckpt_path = "outputs/model/diff-params-ARGS=1/PCB5/params-last.pt"
-    image_path = "datasets/RealIAD/PCB5/test/bad/pcb_0001_NG_HS_C1_20231028093757.jpg"
+    # ckpt_path = "outputs/model/diff-params-ARGS=1/PCB5/params-last.pt"
+    # image_path = "datasets/RealIAD/PCB5/test/bad/pcb_0123_NG_ZW_C1_20231028122009.jpg"
+    ckpt_path = "params-best (1).pt"
+    image_path = "datasets/denso_dataset/mat_tru/test/bad/7_2024_9_5_11_25_49_8_P4.png"
     heatmap_threshold = 0.5
     # 1. Load checkpoint và lấy args từ đó
     ckpt_state = load_checkpoint(ckpt_path, device)
-    # args = defaultdict_from_json(ckpt_state['args'])
-    args = json.load(open("args/args1.json"))
+    args = ckpt_state['args']
     args = defaultdict_from_json(args)
-    # print(args)
+    print(args)
     
     # 2. Khởi tạo model với args đã load
     unet_model = UNetModel(args['img_size'][0], args['base_channels'], channel_mults=args['channel_mults'], dropout=args[
@@ -433,7 +469,7 @@ if __name__ == "__main__":
             in_channels=args["channels"]
             ).to(device)
 
-    seg_model = SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
+    seg_model = SegmentationSubNetwork(in_channels=args["channels"] * 2, out_channels=1).to(device)
 
     # 3. Khởi tạo DDPM
     betas = get_beta_schedule(args['T'], args['beta_schedule'])

@@ -77,8 +77,7 @@ def load_models():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Configuration paths
-    model_paths = ['outputs/model/diff-params-ARGS=1/PCB5/params-last.pt', os.path.join('..', 'outputs/model/diff-params-ARGS=1/PCB5/params-last.pt')]
-    args_paths = ['args/args1.json', os.path.join('..', 'args/args1.json')]
+    model_paths = ['outputs/model/diff-params-ARGS=1/PCB5/params-last.pt']
     
     # Load model checkpoint
     ckpt_state = None
@@ -94,24 +93,22 @@ def load_models():
     if ckpt_state is None:
         st.error("No model checkpoint found!")
         return None
-    
-    # Load args
+
+    # Args lấy luôn trong state dict của checkpoint
     args = None
-    for args_path in args_paths:
-        if os.path.exists(args_path):
+    if 'args' in ckpt_state:
+        args = ckpt_state['args']
+        # Convert dict to defaultdict if necessary
+        if not isinstance(args, defaultdict):
             try:
-                with open(args_path) as f:
-                    args = json.load(f)
                 args = defaultdict_from_json(args)
-                st.success(f"Args loaded from {args_path}")
-                break
             except Exception as e:
-                st.warning(f"Failed to load args from {args_path}: {e}")
-    
-    if args is None:
-        st.error("No args file found!")
+                st.warning(f"Args in checkpoint could not be converted to defaultdict: {e}")
+        st.success(f"Args loaded from checkpoint state_dict")
+    else:
+        st.error("No args found in checkpoint state!")
         return None
-    
+
     try:
         # Initialize models
         unet_model = UNetModel(
@@ -124,7 +121,7 @@ def load_models():
             in_channels=args["channels"]
         ).to(device)
 
-        seg_model = SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
+        seg_model = SegmentationSubNetwork(in_channels=args["channels"] * 2, out_channels=1).to(device)
 
         # Initialize DDPM
         betas = get_beta_schedule(args['T'], args['beta_schedule'])
