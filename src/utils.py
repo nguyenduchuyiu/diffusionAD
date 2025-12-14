@@ -406,17 +406,22 @@ texture_list = ['carpet', 'zipper', 'leather', 'tile', 'wood','grid',
 
 
 class RealIADTestDataset(Dataset):
-    def __init__(self, data_path, classname, img_size):
+    def __init__(self, data_path, classname, img_size, channels=3):
         # data_path already includes RealIAD/classname, just add test
         self.root_dir = os.path.join(data_path, 'test')
         self.images = sorted(glob.glob(self.root_dir + "/*/*.jpg"))
         self.resize_shape = [img_size[0], img_size[1]]
+        self.channels = channels
 
     def __len__(self):
         return len(self.images)
 
     def transform_image(self, image_path, mask_path):
-        image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+        image = cv2.imread(image_path)
+        if self.channels == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         if mask_path is not None:
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         else:
@@ -428,7 +433,10 @@ class RealIADTestDataset(Dataset):
         image = image / 255.0
         mask = mask / 255.0
 
-        image = np.transpose(np.array(image).astype(np.float32), (2, 0, 1))
+        if self.channels == 1:
+            image = np.expand_dims(np.array(image).astype(np.float32), axis=0)
+        else:
+            image = np.transpose(np.array(image).astype(np.float32), (2, 0, 1))
         mask = np.transpose(np.expand_dims(np.array(mask).astype(np.float32), axis=2), (2, 0, 1))
         return image, mask
 
@@ -456,6 +464,7 @@ class RealIADTrainDataset(Dataset):
         self.root_dir = os.path.join(data_path, 'train', 'good')
         self.resize_shape = [img_size[0], img_size[1]]
         self.anomaly_source_path = args["anomaly_source_path"]
+        self.channels = args.get("channels", 3)
         # Hỗ trợ nhiều định dạng ảnh, không chỉ .jpg
         IMAGE_EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.tif", "*.webp"]
         self.image_paths = []
@@ -476,12 +485,11 @@ class RealIADTrainDataset(Dataset):
         
         print(f"Dataset initialized with {len(self.image_paths)} training images and {len(self.anomaly_source_paths)} anomaly sources")
 
-        # Giữ nguyên các augmenters - chuyển sang albumentations
+        # Augmenters - skip HueSaturationValue for grayscale
         self.augmenters = [
             A.RandomGamma(gamma_limit=(50, 200), p=1.0),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
             A.Sharpen(alpha=(0.2, 0.5), lightness=(0.5, 1.0), p=1.0),
-            A.HueSaturationValue(hue_shift_limit=50, sat_shift_limit=50, val_shift_limit=0, p=1.0),
             A.Solarize(threshold=128, p=1.0),
             A.Posterize(num_bits=4, p=1.0),
             A.InvertImg(p=1.0),
@@ -489,6 +497,8 @@ class RealIADTrainDataset(Dataset):
             A.Equalize(mode='cv', by_channels=True, p=1.0),
             A.Rotate(limit=45, p=1.0)
         ]
+        if self.channels == 3:
+            self.augmenters.append(A.HueSaturationValue(hue_shift_limit=50, sat_shift_limit=50, val_shift_limit=0, p=1.0))
         self.rot_transform = A.Rotate(limit=90, p=1.0)
 
     def __len__(self):
@@ -554,9 +564,16 @@ class RealIADTrainDataset(Dataset):
             
             if self.classname in texture_list: # only DTD
                 aug = self.randAugmenter()
-                anomaly_source_img = cv2.cvtColor(cv2.imread(anomaly_source_path),cv2.COLOR_BGR2RGB)
-                anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
-                    self.resize_shape[1], self.resize_shape[0]))
+                anomaly_source_img = cv2.imread(anomaly_source_path)
+                if self.channels == 1:
+                    anomaly_source_img = cv2.cvtColor(anomaly_source_img, cv2.COLOR_BGR2GRAY)
+                    anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                        self.resize_shape[1], self.resize_shape[0]))
+                    anomaly_source_img = np.expand_dims(anomaly_source_img, axis=2)
+                else:
+                    anomaly_source_img = cv2.cvtColor(anomaly_source_img, cv2.COLOR_BGR2RGB)
+                    anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                        self.resize_shape[1], self.resize_shape[0]))
                 anomaly_img_augmented = aug(image=anomaly_source_img)['image']
                 img_object_thr = anomaly_img_augmented.astype(
                     np.float32) * object_perlin/255.0
@@ -564,9 +581,16 @@ class RealIADTrainDataset(Dataset):
                 texture_or_patch = torch.rand(1).numpy()[0]
                 if texture_or_patch > 0.5:  # >0.5 is DTD 
                     aug = self.randAugmenter()
-                    anomaly_source_img = cv2.cvtColor(cv2.imread(anomaly_source_path),cv2.COLOR_BGR2RGB)
-                    anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
-                        self.resize_shape[1], self.resize_shape[0]))
+                    anomaly_source_img = cv2.imread(anomaly_source_path)
+                    if self.channels == 1:
+                        anomaly_source_img = cv2.cvtColor(anomaly_source_img, cv2.COLOR_BGR2GRAY)
+                        anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                            self.resize_shape[1], self.resize_shape[0]))
+                        anomaly_source_img = np.expand_dims(anomaly_source_img, axis=2)
+                    else:
+                        anomaly_source_img = cv2.cvtColor(anomaly_source_img, cv2.COLOR_BGR2RGB)
+                        anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                            self.resize_shape[1], self.resize_shape[0]))
                     anomaly_img_augmented = aug(image=anomaly_source_img)['image']
                     img_object_thr = anomaly_img_augmented.astype(
                         np.float32) * object_perlin/255.0
@@ -610,8 +634,14 @@ class RealIADTrainDataset(Dataset):
         if self._cache_enabled and image_path in self._image_cache:
             return self._image_cache[image_path]
         
-        image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, dsize=(self.resize_shape[1], self.resize_shape[0]))
+        image = cv2.imread(image_path)
+        if self.channels == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            image = cv2.resize(image, dsize=(self.resize_shape[1], self.resize_shape[0]))
+            image = np.expand_dims(image, axis=2)  # (H, W, 1)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image, dsize=(self.resize_shape[1], self.resize_shape[0]))
         
         if self._cache_enabled:
             self._image_cache[image_path] = image

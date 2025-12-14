@@ -187,7 +187,7 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
             loss_type=args['loss-type'], noise=args["noise_fn"], img_channels=in_channels
             )
 
-    seg_model=SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
+    seg_model=SegmentationSubNetwork(in_channels=in_channels*2, out_channels=1).to(device)
 
     use_gradient_checkpointing = args.get('use_gradient_checkpointing', True)
     if use_gradient_checkpointing:
@@ -527,7 +527,7 @@ def save(unet_model,seg_model, args,final,epoch,sub_class, training_history=None
     
     
 
-def main():
+def main(args_file):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = torch.device("cpu")
     
@@ -542,7 +542,7 @@ def main():
         print("Using CPU for training")
     
     # read file from argument
-    file = "args1.json"
+    file = args_file
     # load the json args
     with open(f'./args/{file}', 'r') as f:
         args = json.load(f)
@@ -619,6 +619,5 @@ def main():
         train(training_dataset_loader, test_loader, args, data_len,sub_class,class_type,device, num_gpus)
 
 if __name__ == '__main__':
-    
     seed(42)
-    main()
+    main("args2.json")
