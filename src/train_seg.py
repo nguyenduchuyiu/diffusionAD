@@ -37,10 +37,17 @@ def train_seg(args, sub_class, device, ckpt_path):
     unet.eval()
     for p in unet.parameters():
         p.requires_grad = False
-    
+
+    # Use DataParallel for unet if multiple GPUs are available (mostly defensive, since it's frozen)
+    if torch.cuda.device_count() > 1:
+        unet = torch.nn.DataParallel(unet)
+
     # Segmentation model (trainable)
     seg_model = SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
-    seg_model.load_state_dict(torch.load(ckpt_path)['seg_model_state_dict'])
+    seg_model.load_state_dict(checkpoint['seg_model_state_dict'])
+    # Use DataParallel for segmentation model if multiple GPUs are available
+    if torch.cuda.device_count() > 1:
+        seg_model = torch.nn.DataParallel(seg_model)
     # Diffusion sampler
     betas = get_beta_schedule(args['T'], args['beta_schedule'])
     ddpm = GaussianDiffusionModel(
@@ -54,7 +61,12 @@ def train_seg(args, sub_class, device, ckpt_path):
     loader = DataLoader(dataset, batch_size=args['Batch_Size'], shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     
     # Optimizer & Loss
-    optimizer = optim.Adam(seg_model.parameters(), lr=args.get('seg_lr', 1e-4))
+    # Only the parameters of the underlying model are passed to the optimizer
+    # (DataParallel exposes a .module attribute)
+    optimizer = optim.Adam(
+        seg_model.module.parameters() if isinstance(seg_model, torch.nn.DataParallel) else seg_model.parameters(),
+        lr=args.get('seg_lr', 1e-4)
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
     focal_loss = BinaryFocalLoss().to(device)
     smL1_loss = nn.SmoothL1Loss().to(device)
@@ -79,7 +91,10 @@ def train_seg(args, sub_class, device, ckpt_path):
             anomaly_label = sample['has_anomaly'].to(device).squeeze()
             
             with torch.no_grad():
-                _, pred_x0, *_ = ddpm.norm_guided_one_step_denoising(unet, aug_image, anomaly_label, args)
+                # If unet is DataParallel, call .module for compatibility with state_dict (already handled above)
+                unet_forward = unet
+                # Don't need .module here because DataParallel respects __call__
+                _, pred_x0, *_ = ddpm.norm_guided_one_step_denoising(unet_forward, aug_image, anomaly_label, args)
             
             pred_mask = seg_model(torch.cat((aug_image, pred_x0), dim=1))
             fl = focal_loss(pred_mask, anomaly_mask)
@@ -93,9 +108,13 @@ def train_seg(args, sub_class, device, ckpt_path):
             epoch_loss += loss.item()
             epoch_focal += fl.item()
             epoch_smL1 += sl.item()
-            tbar.set_postfix(loss=f'{loss.item():.4f}')
+            tbar.set_postfix(loss=f'{epoch_loss/(tbar.n+1):.4f}')
         
         scheduler.step()
+        n_batches = len(loader)
+        epoch_loss /= n_batches
+        epoch_focal /= n_batches
+        epoch_smL1 /= n_batches
         losses['total'].append(epoch_loss)
         losses['focal'].append(epoch_focal)
         losses['smL1'].append(epoch_smL1)
@@ -104,8 +123,9 @@ def train_seg(args, sub_class, device, ckpt_path):
             best_loss = epoch_loss
             save_path = f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/{sub_class}'
             os.makedirs(save_path, exist_ok=True)
+            # Save underlying model's state_dict if using DataParallel
             torch.save({
-                'seg_model_state_dict': seg_model.state_dict(),
+                'seg_model_state_dict': seg_model.module.state_dict() if isinstance(seg_model, torch.nn.DataParallel) else seg_model.state_dict(),
                 'epoch': epoch, 'loss': best_loss
             }, f'{save_path}/seg-best.pt')
             print(f'Best model saved at epoch {epoch}, loss={best_loss:.4f}')
@@ -114,7 +134,7 @@ def train_seg(args, sub_class, device, ckpt_path):
             save_path = f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/{sub_class}'
             os.makedirs(save_path, exist_ok=True)
             torch.save({
-                'seg_model_state_dict': seg_model.state_dict(),
+                'seg_model_state_dict': seg_model.module.state_dict() if isinstance(seg_model, torch.nn.DataParallel) else seg_model.state_dict(),
                 'epoch': epoch, 'loss': epoch_loss
             }, f'{save_path}/seg-last.pt')
             print(f'Checkpoint saved at epoch {epoch}, loss={epoch_loss:.4f}')
@@ -157,7 +177,7 @@ def main():
     ckpt_path = "outputs/model/diff-params-ARGS=1/metal_nut/params-last.pt"
     args['arg_num'] = '1'
     args = defaultdict(str, args)
-    
+    args['EPOCHS'] = 1800 # can override
     classes = os.listdir(os.path.join(args["data_root_path"], args['data_name']))
     for sub_class in classes:
         print(f"\n=== Training segmentation for {sub_class} ===")
