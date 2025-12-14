@@ -26,3 +26,5 @@ plotly>=5.15.0
 tqdm>=4.65.0
 pathlib2>=2.3.7
 
+albumentations
+scikit-image
