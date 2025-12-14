@@ -452,10 +452,10 @@ if __name__ == "__main__":
     # device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    # ckpt_path = "outputs/model/diff-params-ARGS=1/PCB5/params-last.pt"
-    # image_path = "datasets/RealIAD/PCB5/test/bad/pcb_0123_NG_ZW_C1_20231028122009.jpg"
-    ckpt_path = "params-best (1).pt"
-    image_path = "datasets/denso_dataset/mat_tru/test/bad/7_2024_9_5_11_25_49_8_P4.png"
+    ckpt_path = "outputs/model/diff-params-ARGS=1/metal_nut/params-last.pt"
+    image_path = "mvtec_reformat/RealIAD/metal_nut/test/bad/000.png"
+    # ckpt_path = "params-best (1).pt"
+    # image_path = "datasets/denso_dataset/mat_tru/test/bad/7_2024_9_5_11_25_49_8_P4.png"
     heatmap_threshold = 0.5
     # 1. Load checkpoint và lấy args từ đó
     ckpt_state = load_checkpoint(ckpt_path, device)

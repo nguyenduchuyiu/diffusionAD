@@ -77,7 +77,7 @@ def load_models():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Configuration paths
-    model_paths = ['outputs/model/diff-params-ARGS=1/PCB5/params-last.pt']
+    model_paths = ['outputs/model/diff-params-ARGS=1/metal_nut/params-last.pt']
     
     # Load model checkpoint
     ckpt_state = None
