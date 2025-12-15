@@ -135,7 +135,7 @@ class AugmentedTrainDataset(Dataset):
             x = random.randint(pad, w - pad)
             if foreground[y, x] < 0.5:
                 continue
-            fill_value = random.randint(15, 60)
+            fill_value = random.randint(15, 30)
             shape_type = random.choice(['circle', 'poly', 'blob'])
             if shape_type == 'circle':
                 radius = random.randint(2, 6)
@@ -683,9 +683,9 @@ def plot_losses(losses, sub_class, args, final=False):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    with open('./args/args1.json', 'r') as f:
+    with open('./args/args2.json', 'r') as f:
         args = json.load(f)
-    ckpt_path = "/kaggle/input/diffusionad/diffusionAD/outputs/model/diff-params-ARGS=2/mat_tru/params-last.pt"
+    ckpt_path = "outputs/model/diff-params-ARGS=2/mat_tru/params-last.pt"
     args['arg_num'] = '2'
     args = defaultdict(str, args)
     args['EPOCHS'] = 10 # can override

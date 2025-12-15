@@ -7,7 +7,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
-from train_seg import AugmentedTrainDataset
+from src.train_seg import AugmentedTrainDataset
 
 # Load args
 with open('./args/args2.json', 'r') as f:
