@@ -13,11 +13,14 @@ import sys
 from pathlib import Path
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots  # <--- MỚI THÊM
 import pandas as pd
 import torch
 import json
 from collections import defaultdict
 import time
+import tempfile
+import shutil
 
 # Add src directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -62,39 +65,44 @@ st.markdown("""
     .anomaly-score-high {
         color: #dc3545;
     }
-    /* Ensure all images in visualization columns have same height */
-    div[data-testid="column"] div[data-testid="stImage"] img {
-        max-height: 300px;
-        width: 100%;
-        object-fit: contain;
-    }
+    /* Điều chỉnh style cho plotly chart nếu cần */
 </style>
 """, unsafe_allow_html=True)
 
+def get_available_models(root_dir="outputs"):
+    """Recursively find .pt files in the outputs directory"""
+    model_files = []
+    if os.path.exists(root_dir):
+        for root, dirs, files in os.walk(root_dir):
+            for file in files:
+                if file.endswith(".pt"):
+                    # Create a relative path for display
+                    full_path = os.path.join(root, file)
+                    model_files.append(full_path)
+    return sorted(model_files)
+
 @st.cache_resource
-def load_models():
-    """Load trained diffusion models with caching"""
+def load_models(model_path):
+    """Load trained diffusion models from a specific path"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Configuration paths
-    model_paths = ['outputs/model/diff-params-ARGS=1/metal_nut/params-last.pt']
     
     # Load model checkpoint
     ckpt_state = None
-    for model_path in model_paths:
-        if os.path.exists(model_path):
-            try:
-                ckpt_state = load_checkpoint(model_path, device)
-                st.success(f"Model checkpoint loaded from {model_path}")
-                break
-            except Exception as e:
-                st.warning(f"Failed to load model from {model_path}: {e}")
+    if os.path.exists(model_path):
+        try:
+            ckpt_state = load_checkpoint(model_path, device)
+        except Exception as e:
+            st.error(f"Failed to load model from {model_path}: {e}")
+            return None
+    else:
+        st.error(f"Model path does not exist: {model_path}")
+        return None
     
     if ckpt_state is None:
         st.error("No model checkpoint found!")
         return None
 
-    # Args lấy luôn trong state dict của checkpoint
+    # Args loaded from checkpoint state_dict
     args = None
     if 'args' in ckpt_state:
         args = ckpt_state['args']
@@ -104,7 +112,6 @@ def load_models():
                 args = defaultdict_from_json(args)
             except Exception as e:
                 st.warning(f"Args in checkpoint could not be converted to defaultdict: {e}")
-        st.success(f"Args loaded from checkpoint state_dict")
     else:
         st.error("No args found in checkpoint state!")
         return None
@@ -140,14 +147,13 @@ def load_models():
         unet_model.eval()
         seg_model.eval()
         
-        st.success("All diffusion models loaded successfully!")
-        
         return {
             'unet_model': unet_model,
             'seg_model': seg_model,
             'ddpm': ddpm,
             'args': args,
-            'device': device
+            'device': device,
+            'model_path': model_path
         }
         
     except Exception as e:
@@ -190,7 +196,7 @@ def predict_batch_images(models, image_arrays, batch_size=8, heatmap_threshold=0
     return results
 
 def display_prediction_results(result, method, image):
-    """Display prediction results"""
+    """Display prediction results with interactive Plotly visualization"""
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -229,36 +235,67 @@ def display_prediction_results(result, method, image):
                 delta=None
             )
     
-    # Display visualizations for diffusion model
+    # Display visualizations for diffusion model using Plotly for zoom capability
     if 'heatmap' in result:
-        st.subheader("Visual Analysis")
+        st.subheader("Visual Analysis (Interactive Zoom/Pan)")
         
-        col1, col2, col3, col4, col5 = st.columns(5)
+        # Define titles and image keys
+        titles = ["Original", "Reconstruction", "Recon (Noisier)", "Anomaly Mask", "Heatmap Overlay"]
+        keys = ['original_image', 'reconstructed_image', 'recon_noisier', 'anomaly_mask', 'heatmap_overlay']
         
-        with col1:
-            st.subheader("Original Image")
-            st.image(result['original_image'], use_container_width=True)
+        # Create subplots: 1 row, 5 columns
+        fig = make_subplots(
+            rows=1, cols=5,
+            subplot_titles=titles,
+            horizontal_spacing=0.01,
+            vertical_spacing=0.02
+        )
         
-        with col2:
-            st.subheader("Reconstruction")
-            st.image(result['reconstructed_image'], use_container_width=True)
-            
-        with col3:
-            st.subheader("Recon (Noisier)")
-            st.image(result['recon_noisier'], use_container_width=True)
+        # Helper to ensure image format is correct for Plotly
+        def process_for_plotly(img):
+            # Ensure it's numpy array
+            if not isinstance(img, np.ndarray):
+                img = np.array(img)
+            # If float 0-1, convert to 0-255 uint8 for consistent display
+            if img.dtype.kind == 'f' and img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            elif img.dtype != np.uint8:
+                img = img.astype(np.uint8)
+            return img
+
+        # Add each image to the figure
+        for i, key in enumerate(keys):
+            if key in result:
+                img_data = process_for_plotly(result[key])
+                fig.add_trace(
+                    go.Image(z=img_data, hoverinfo='skip'), # skip hover to make it cleaner
+                    row=1, col=i+1
+                )
         
-        with col4:
-            st.subheader("Anomaly Mask")
-            st.image(result['anomaly_mask'], use_container_width=True)
-            
-        with col5:
-            st.subheader("Heatmap Overlay")
-            st.image(result['heatmap_overlay'], use_container_width=True)
+        # Update layout properties
+        fig.update_layout(
+            height=350,  # Adjust height
+            margin=dict(l=10, r=10, t=30, b=10),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            dragmode='zoom'  # Enable zoom by default
+        )
+        
+        # Hide axis ticks for all subplots to look like cleaner images
+        fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False)
+        fig.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+        
+        # Render the interactive chart
+        st.plotly_chart(fig, use_container_width=True)
 
 def batch_analysis_page(models):
     """Batch analysis page"""
     st.header("Batch Analysis")
     
+    if models is None:
+        st.warning("Please load a model from the sidebar first.")
+        return
+
     uploaded_files = st.file_uploader(
         "Upload multiple images for batch analysis",
         type=['png', 'jpg', 'jpeg'],
@@ -273,10 +310,6 @@ def batch_analysis_page(models):
             batch_size = st.slider("Batch Size", min_value=1, max_value=32, value=8, step=1)
         
         if st.button("Analyze Batch"):
-            if models is None:
-                st.error("Diffusion models not available!")
-                return
-            
             # Convert uploaded files to image arrays
             image_arrays = []
             filenames = []
@@ -363,32 +396,69 @@ def main():
     # Title
     st.markdown("<h1 class='main-header'>🔍 Diffusion Anomaly Detection Demo</h1>", unsafe_allow_html=True)
     
-    # Load models
+    # Initialize session state for models
     if 'models' not in st.session_state:
-        st.session_state.models = load_models()
+        st.session_state.models = None
     
-    models = st.session_state.models
+    # Sidebar: Model Selection
+    st.sidebar.title("Model Configuration")
     
-    # Sidebar
-    st.sidebar.title("Configuration")
+    input_method = st.sidebar.radio("Model Source:", ["Select from list", "Upload file"])
     
-    # Page selection
-    page = st.sidebar.selectbox("Select Page", ["Single Image Analysis", "Batch Analysis"])
+    selected_model_path = None
     
-    # Model info
-    st.sidebar.subheader("Model Information")
-    if models:
+    if input_method == "Select from list":
+        available_models = get_available_models()
+        if not available_models:
+            st.sidebar.warning("No models found in 'outputs/' directory.")
+        else:
+            selected_model_path = st.sidebar.selectbox(
+                "Choose a model (.pt):", 
+                available_models,
+                index=0
+            )
+    else:
+        uploaded_model = st.sidebar.file_uploader("Upload .pt checkpoint", type=['pt'])
+        if uploaded_model is not None:
+            # Save uploaded file to a temporary location because load_checkpoint expects a path
+            temp_dir = tempfile.mkdtemp()
+            temp_path = os.path.join(temp_dir, uploaded_model.name)
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_model.getbuffer())
+            selected_model_path = temp_path
+            st.sidebar.info(f"Uploaded: {uploaded_model.name}")
+
+    # Load Model Button
+    if selected_model_path:
+        if st.sidebar.button("Load Model", type="primary"):
+            with st.spinner(f"Loading model from {os.path.basename(selected_model_path)}..."):
+                st.session_state.models = load_models(selected_model_path)
+            
+            if st.session_state.models:
+                st.sidebar.success("Model loaded successfully!")
+    
+    # Display current model info
+    if st.session_state.models:
+        models = st.session_state.models
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Current Model Info")
         st.sidebar.text(f"Device: {models['device']}")
         st.sidebar.text(f"Image Size: {models['args']['img_size']}")
-        st.sidebar.text(f"Base Channels: {models['args']['base_channels']}")
-        st.sidebar.text(f"Timesteps: {models['args']['T']}")
+        st.sidebar.text(f"Steps (T): {models['args']['T']}")
+        st.sidebar.text(f"File: {os.path.basename(models['model_path'])}")
     else:
-        st.sidebar.error("Models not loaded!")
+        st.warning("⚠️ No model loaded. Please select and load a model from the sidebar to proceed.")
+
+    # Main Page Content
+    st.sidebar.markdown("---")
+    page = st.sidebar.selectbox("Select Page", ["Single Image Analysis", "Batch Analysis"])
     
     if page == "Single Image Analysis":
-        if not models:
-            st.error("No models available! Please check model files.")
+        if not st.session_state.models:
+            st.info("Please load a model from the sidebar to start analysis.")
             st.stop()
+        
+        models = st.session_state.models
         
         # Main content
         st.header("Single Image Analysis")
@@ -418,37 +488,9 @@ def main():
                     
                     st.subheader("Detection Results")
                     display_prediction_results(result, "diffusion_model", image_array)
-        
-        # Sample images section
-        st.subheader("Try with Sample Images")
-        sample_dir = Path("../datasets/RealIAD/PCB5/test")
-        if sample_dir.exists():
-            sample_subdirs = [d for d in sample_dir.iterdir() if d.is_dir()]
-            if sample_subdirs:
-                selected_subdir = st.selectbox(
-                    "Select category",
-                    sample_subdirs,
-                    format_func=lambda x: x.name
-                )
-                
-                sample_images = list(selected_subdir.glob("*.jpg")) + list(selected_subdir.glob("*.png"))
-                if sample_images:
-                    selected_sample = st.selectbox(
-                        "Select a sample image",
-                        sample_images[:10],  # Limit to first 10 images
-                        format_func=lambda x: x.name
-                    )
-                    
-                    if st.button("Analyze Sample"):
-                        sample_image = np.array(Image.open(selected_sample))
-                        st.image(sample_image, caption=str(selected_sample), use_container_width=True)
-                        
-                        with st.spinner("Analyzing sample image..."):
-                            result = predict_single_image(models, sample_image, heatmap_threshold=threshold)
-                            display_prediction_results(result, "diffusion_model", sample_image)
     
     elif page == "Batch Analysis":
-        batch_analysis_page(models)
+        batch_analysis_page(st.session_state.models)
     
     # Footer
     st.markdown("---")

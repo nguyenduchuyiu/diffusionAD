@@ -44,7 +44,11 @@ def preprocess_image(image_path, img_size=(256, 256), channels=3):
         image = torch.from_numpy(image).unsqueeze(0)  # (1, 3, H, W)
     return image
 
-def denormalize_image(tensor_image):
+def denormalize_image(tensor_image, brightness_offset=-100):
+    """
+    Convert model output tensor to displayable image.
+    brightness_offset: reduce brightness (negative = darker)
+    """
     img = tensor_image.cpu().squeeze(0)
     if img.dim() == 2:  # Grayscale (H, W)
         img_np = img.numpy()
@@ -52,9 +56,14 @@ def denormalize_image(tensor_image):
         img_np = img.squeeze(0).numpy()
     else:  # RGB (C, H, W)
         img_np = img.permute(1, 2, 0).numpy()
-    img_np = (img_np + 1) / 2.0
+    
+    # Check if data is in [-1, 1] or [0, 1] range
+    if img_np.min() < 0:
+        img_np = (img_np + 1) / 2.0
+    
     img_np = np.nan_to_num(img_np, nan=0.0, posinf=1.0, neginf=0.0)
-    img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+    img_np = np.clip(img_np * 255 + brightness_offset, 0, 255).astype(np.uint8)
+    
     # Convert grayscale to RGB for display
     if len(img_np.shape) == 2:
         img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
@@ -452,10 +461,10 @@ if __name__ == "__main__":
     # device = torch.device("cpu")
     print(f"Using device: {device}")
     
-    ckpt_path = "outputs/model/diff-params-ARGS=1/metal_nut/params-last.pt"
-    image_path = "mvtec_reformat/RealIAD/metal_nut/test/bad/000.png"
-    # ckpt_path = "params-best (1).pt"
-    # image_path = "datasets/denso_dataset/mat_tru/test/bad/7_2024_9_5_11_25_49_8_P4.png"
+    # ckpt_path = "outputs/model/diff-params-ARGS=1/metal_nut/params-last.pt"
+    # image_path = "mvtec_reformat/RealIAD/metal_nut/test/bad/000.png"
+    ckpt_path = "outputs/model/diff-params-ARGS=2/mat_truc/merged-params-best.pt"
+    image_path = "datasets/DENSO/mat_truc/test/bad/7_2024_9_5_12_49_33_166_P4.png"
     heatmap_threshold = 0.5
     # 1. Load checkpoint và lấy args từ đó
     ckpt_state = load_checkpoint(ckpt_path, device)
